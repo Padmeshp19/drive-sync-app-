@@ -39,7 +39,23 @@ const el = {
   selectAllBtn: document.getElementById('selectAllBtn'),
   titleType: document.getElementById('titleType'),
   cancelSyncBtn: document.getElementById('cancelSyncBtn'),
+  toast: document.getElementById('toast'),
+  toastMessage: document.getElementById('toastMessage'),
 };
+
+let toastTimer = null;
+
+function showToast(message, type = 'success') {
+  if (!el.toast || !el.toastMessage) return;
+  el.toastMessage.textContent = message;
+  el.toast.className = `sync-toast ${type}`;
+  void el.toast.offsetWidth;
+  el.toast.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    el.toast.classList.remove('show');
+  }, 4000);
+}
 
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 GB';
@@ -812,9 +828,15 @@ async function startSync() {
         } else if (eventType === 'cancelled') {
           el.progressText.textContent = 'Sync cancelled';
           addLog('Sync cancelled by user.', 'err');
+          showToast('Sync cancelled successfully', 'success');
         } else if (eventType === 'error') {
           addLog(`Error: ${data.message}`, 'err');
           el.progressText.textContent = 'Sync failed — see log';
+          if (el.cancelSyncBtn) {
+            el.cancelSyncBtn.classList.add('hidden');
+            el.cancelSyncBtn.disabled = true;
+          }
+          showToast('Sync failed — nothing is currently syncing', 'error');
         }
       }
     }
@@ -822,10 +844,12 @@ async function startSync() {
     if (err.name === 'AbortError') {
       el.progressText.textContent = 'Sync cancelled';
       addLog('Sync cancelled by user.', 'err');
+      showToast('Sync cancelled successfully', 'success');
     } else {
       console.error('Sync error:', err);
       addLog(`Error: ${err.message}`, 'err');
       el.progressText.textContent = 'Sync failed — see log';
+      showToast('Sync failed — nothing is currently syncing', 'error');
     }
   } finally {
     state.syncActive = false;
@@ -842,7 +866,12 @@ async function startSync() {
 }
 
 function cancelSync() {
-  if (!state.syncActive || !state.syncController) return;
+  if (!state.syncActive || !state.syncController) {
+    if (el.cancelSyncBtn) el.cancelSyncBtn.classList.add('hidden');
+    showToast('Sync is already stopped', 'info');
+    return;
+  }
+
   if (el.cancelSyncBtn) {
     el.cancelSyncBtn.disabled = true;
     el.cancelSyncBtn.textContent = 'Cancelling…';
