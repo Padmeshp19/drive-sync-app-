@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: drive-sync-app
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        value: https://drive-sync-app.onrender.com/auth/google/callback
+      - key: MS_CLIENT_ID
+        sync: false
+      - key: MS_CLIENT_SECRET
+        sync: false
+      - key: MS_REDIRECT_URI
+        value: https://drive-sync-app.onrender.com/auth/microsoft/callback
+      - key: MS_TENANT
+        value: common
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: PORT
+        value: 10000

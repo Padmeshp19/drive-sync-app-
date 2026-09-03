@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Drive → OneDrive Sync</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <h1>Drive <span class="arrow">&rarr;</span> OneDrive</h1>
+      <div class="conn-status" id="connStatus">
+        <span class="pill" id="googlePill">Google: checking&hellip;</span>
+        <span class="pill" id="msPill">Microsoft: checking&hellip;</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel tree-panel">
+        <div class="panel-header">
+          <h2>Pick what to sync</h2>
+          <button id="refreshBtn" class="btn-ghost" title="Refresh">&#8635;</button>
+        </div>
+        <div id="breadcrumb" class="breadcrumb"></div>
+        <ul id="tree" class="tree"></ul>
+      </section>
+
+      <section class="panel sync-panel">
+        <div class="panel-header">
+          <h2>Sync</h2>
+        </div>
+        <label class="field">
+          <span>Destination folder in OneDrive</span>
+          <input id="destFolder" type="text" value="DriveSync" />
+        </label>
+        <div id="selectedList" class="selected-list"></div>
+        <button id="syncBtn" class="btn-primary" disabled>Select items to sync</button>
+
+        <div id="progressWrap" class="progress-wrap hidden">
+          <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
+          <p id="progressText" class="progress-text"></p>
+          <ul id="log" class="log"></ul>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
