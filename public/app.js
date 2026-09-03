@@ -38,12 +38,31 @@ function setPill(pillEl, label, connected) {
 }
 
 async function loadFolder(folderId) {
-  el.tree.innerHTML = '<li class="tree-item"><span class="name">Loading&hellip;</span></li>';
+  el.tree.innerHTML =
+    '<li class="tree-item"><span class="name">Loading&hellip;</span></li>';
+
   try {
-    const res = await fetch(`/drive/list?parentId=${encodeURIComponent(folderId)}`).then((r) => r.json());
-    renderTree(res.files || []);
+    const response = await fetch(
+      `/drive/list?parentId=${encodeURIComponent(folderId)}`
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+    }
+
+    renderTree(data.files || []);
   } catch (err) {
-    el.tree.innerHTML = `<li class="tree-item"><span class="name">Failed to load: ${err.message}</span></li>`;
+    console.error('Drive folder load error:', err);
+
+    el.tree.innerHTML = `
+      <li class="tree-item">
+        <span class="name" style="color:#ff6b6b">
+          Failed to load Drive: ${err.message}
+        </span>
+      </li>
+    `;
   }
 }
 
