@@ -18,6 +18,7 @@ const el = {
   selectionSize: document.getElementById('selectionSize'),
   sizeTrackFill: document.getElementById('sizeTrackFill'),
   syncBtn: document.getElementById('syncBtn'),
+  trashBtn: document.getElementById('trashBtn'),
   destFolder: document.getElementById('destFolder'),
   progressWrap: document.getElementById('progressWrap'),
   progressFill: document.getElementById('progressFill'),
@@ -273,6 +274,7 @@ function renderSelectedList() {
       : `${count} item${count === 1 ? '' : 's'} selected`;
 
   el.syncBtn.disabled = count === 0;
+  el.trashBtn.disabled = count === 0;
   setSyncButtonText();
 }
 
@@ -363,6 +365,79 @@ function addLog(text, cls) {
   el.log.scrollTop = el.log.scrollHeight;
 }
 
+async function moveSelectedToTrash() {
+  const items = Array.from(state.selected.values());
+  if (items.length === 0) return;
+
+  const folderCount = items.filter((item) => item.isFolder).length;
+  const fileCount = items.length - folderCount;
+  const parts = [];
+  if (fileCount) parts.push(`${fileCount} file${fileCount === 1 ? '' : 's'}`);
+  if (folderCount) parts.push(`${folderCount} folder${folderCount === 1 ? '' : 's'}`);
+
+  const confirmed = window.confirm(
+    `Move ${parts.join(' and ')} to Google Drive Trash?\n\n` +
+    `This removes the selected item${items.length === 1 ? '' : 's'} from My Drive. ` +
+    `You can restore them from Google Drive Trash.`
+  );
+
+  if (!confirmed) return;
+
+  el.syncBtn.disabled = true;
+  el.trashBtn.disabled = true;
+  el.progressWrap.classList.remove('hidden');
+  el.progressFill.style.width = '0%';
+  el.progressText.textContent = `Moving 0 / ${items.length} to Trash`;
+  el.log.innerHTML = '';
+
+  try {
+    const resp = await fetch('/drive/trash', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        items: items.map(({ id, name, isFolder }) => ({ id, name, isFolder })),
+      }),
+    });
+
+    const data = await resp.json().catch(() => ({}));
+
+    if (!resp.ok) {
+      throw new Error(data.detail || data.error || `HTTP ${resp.status}`);
+    }
+
+    for (const result of data.results || []) {
+      if (result.success) {
+        addLog(`✓ Moved to Trash: ${result.name}`, 'ok');
+        state.selected.delete(result.id);
+      } else {
+        addLog(`Error: ${result.name} — ${result.error}`, 'err');
+      }
+    }
+
+    const moved = Number(data.trashed) || 0;
+    const failed = Number(data.failed) || 0;
+    el.progressFill.style.width = items.length ? `${Math.round(((moved + failed) / items.length) * 100)}%` : '100%';
+    el.progressText.textContent = failed
+      ? `Done — ${moved} moved, ${failed} failed`
+      : `Done — ${moved} item${moved === 1 ? '' : 's'} moved to Trash`;
+
+    // Drive listings and selection sizes are now stale, so refresh them.
+    state.folderCache.clear();
+    state.selectionStats = null;
+    renderSelectedList();
+    await loadFolder(folderIdForCurrentPath(), { force: true });
+    updateSelectionSize();
+  } catch (err) {
+    console.error('Drive trash error:', err);
+    addLog(`Error: ${err.message}`, 'err');
+    el.progressText.textContent = 'Delete failed — see log';
+  } finally {
+    el.syncBtn.disabled = state.selected.size === 0;
+    el.trashBtn.disabled = state.selected.size === 0;
+    setSyncButtonText();
+  }
+}
+
 async function startSync() {
   const items = Array.from(state.selected.values());
   if (items.length === 0) return;
@@ -442,6 +517,7 @@ el.refreshBtn.onclick = () => {
 };
 
 el.syncBtn.onclick = startSync;
+el.trashBtn.onclick = moveSelectedToTrash;
 
 document.addEventListener('mousemove', (event) => {
   if (!el.glow) return;

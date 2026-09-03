@@ -1,6 +1,7 @@
 const { google } = require('googleapis');
 
-const SCOPES = ['https://www.googleapis.com/auth/drive.readonly'];
+// Full Drive access is required for moving user-selected files/folders to Trash.
+const SCOPES = ['https://www.googleapis.com/auth/drive'];
 
 function getOAuthClient() {
   return new google.auth.OAuth2(

@@ -122,6 +122,68 @@ async function collectFolderStats(drive, folderId, stats, visited) {
   }
 }
 
+router.post('/trash', requireGoogleAuth, async (req, res) => {
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+
+  if (items.length === 0) {
+    return res.status(400).json({
+      error: 'No items selected',
+      detail: 'Select at least one file or folder to move to Trash.',
+    });
+  }
+
+  if (items.length > 100) {
+    return res.status(400).json({
+      error: 'Too many selected items',
+      detail: 'Select 100 items or fewer at a time.',
+    });
+  }
+
+  const drive = getDriveClient(req.session.googleTokens);
+  const results = [];
+
+  for (const item of items) {
+    if (!item || typeof item.id !== 'string' || !item.id) continue;
+
+    try {
+      const result = await withBackoff(() =>
+        drive.files.update({
+          fileId: item.id,
+          requestBody: { trashed: true },
+          supportsAllDrives: true,
+          fields: 'id, name, trashed',
+        })
+      );
+
+      results.push({
+        id: item.id,
+        name: result.data.name || item.name || 'Unnamed item',
+        trashed: result.data.trashed === true,
+        success: true,
+      });
+    } catch (err) {
+      console.error(`Drive trash error for ${item.id}:`, err.message);
+      results.push({
+        id: item.id,
+        name: item.name || 'Unnamed item',
+        success: false,
+        error: err.message,
+        code: err.code || err.response?.status || null,
+      });
+    }
+  }
+
+  const failed = results.filter((item) => !item.success);
+  const succeeded = results.filter((item) => item.success);
+
+  res.json({
+    success: failed.length === 0,
+    trashed: succeeded.length,
+    failed: failed.length,
+    results,
+  });
+});
+
 router.post('/selection-size', requireGoogleAuth, async (req, res) => {
   const items = Array.isArray(req.body?.items) ? req.body.items : [];
 
