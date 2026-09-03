@@ -5,6 +5,11 @@ const state = {
   folderRequest: 0,
   folderCache: new Map(),
   folderController: null,
+  searchRequest: 0,
+  searchController: null,
+  searchQuery: '',
+  searchResults: [],
+  searchNextPageToken: null,
 };
 
 const el = {
@@ -25,6 +30,8 @@ const el = {
   progressText: document.getElementById('progressText'),
   log: document.getElementById('log'),
   glow: document.getElementById('glow'),
+  driveSearch: document.getElementById('driveSearch'),
+  clearSearchBtn: document.getElementById('clearSearchBtn'),
 };
 
 function formatBytes(bytes) {
@@ -71,6 +78,13 @@ function setPill(pillEl, label, connected) {
 }
 
 async function loadFolder(folderId, options = {}) {
+  state.searchQuery = '';
+  state.searchResults = [];
+  state.searchNextPageToken = null;
+  if (el.driveSearch) el.driveSearch.value = '';
+  if (el.clearSearchBtn) el.clearSearchBtn.classList.add('hidden');
+  if (state.searchController) state.searchController.abort();
+
   const requestId = ++state.folderRequest;
   const cached = state.folderCache.get(folderId);
 
@@ -201,6 +215,152 @@ async function loadMore(folderId, pageToken) {
   } catch (err) {
     console.error('Load more error:', err);
   }
+}
+
+
+async function searchDrive(query, options = {}) {
+  const term = String(query || '').trim();
+
+  if (term.length < 2) {
+    clearDriveSearch(false);
+    return;
+  }
+
+  if (state.searchController) state.searchController.abort();
+  if (state.folderController) state.folderController.abort();
+
+  const requestId = ++state.searchRequest;
+  state.searchQuery = term;
+  if (!options.append) state.searchResults = [];
+  if (!options.append) state.searchNextPageToken = null;
+  if (el.clearSearchBtn) el.clearSearchBtn.classList.remove('hidden');
+
+  if (!options.append) {
+    el.tree.innerHTML =
+      '<li class="tree-item loading-row"><span class="loading-dot"></span><span class="name" style="color:var(--text-dim)">Searching Google Drive…</span></li>';
+  }
+
+  state.searchController = new AbortController();
+
+  try {
+    const params = new URLSearchParams({ q: term });
+    if (options.pageToken) params.set('pageToken', options.pageToken);
+
+    const response = await fetch(`/drive/search?${params.toString()}`, {
+      signal: state.searchController.signal,
+    });
+    const data = await response.json();
+
+    if (requestId !== state.searchRequest) return;
+    if (!response.ok) {
+      throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+    }
+
+    if (options.append) {
+      state.searchResults.push(...(data.files || []));
+    } else {
+      state.searchResults = data.files || [];
+    }
+    state.searchNextPageToken = data.nextPageToken || null;
+    renderSearchResults();
+  } catch (err) {
+    if (err.name === 'AbortError' || requestId !== state.searchRequest) return;
+    console.error('Drive search error:', err);
+    el.tree.innerHTML = `
+      <li class="tree-item">
+        <span class="name" style="color:#fb7185">Search failed: ${escapeHtml(err.message)}</span>
+      </li>
+    `;
+  }
+}
+
+function renderSearchResults() {
+  el.tree.innerHTML = '';
+  el.breadcrumb.innerHTML = '';
+
+  const label = document.createElement('span');
+  label.className = 'search-results-label';
+  label.textContent = `Search results for “${state.searchQuery}”`;
+  el.breadcrumb.appendChild(label);
+
+  if (state.searchResults.length === 0) {
+    el.tree.innerHTML =
+      '<li class="tree-item"><span class="name" style="color:var(--text-dim)">No matching files or folders found.</span></li>';
+    return;
+  }
+
+  for (const file of state.searchResults) {
+    const li = document.createElement('li');
+    li.className = 'tree-item search-result-item';
+
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = state.selected.has(file.id);
+    checkbox.dataset.fileId = file.id;
+    checkbox.setAttribute('aria-label', `Select ${file.name} for sync`);
+    checkbox.onchange = () => {
+      if (checkbox.checked) {
+        state.selected.set(file.id, {
+          id: file.id,
+          name: file.name,
+          isFolder: file.isFolder,
+          size: file.size,
+        });
+      } else {
+        state.selected.delete(file.id);
+      }
+      renderSelectedList();
+      updateSelectionSize();
+    };
+
+    const name = document.createElement('span');
+    name.className = `name ${file.isFolder ? 'folder' : 'file'}`;
+    name.textContent = file.name;
+    name.title = file.name;
+
+    if (file.isFolder) {
+      name.onclick = () => {
+        state.path = [{ id: 'root', name: 'My Drive' }, { id: file.id, name: file.name }];
+        loadFolder(file.id);
+      };
+    }
+
+    const meta = document.createElement('span');
+    meta.className = 'search-result-meta';
+    meta.textContent = file.isFolder ? 'FOLDER' : (file.size ? formatBytes(Number(file.size)) : 'FILE');
+
+    li.appendChild(checkbox);
+    li.appendChild(name);
+    li.appendChild(meta);
+    el.tree.appendChild(li);
+  }
+
+  if (state.searchNextPageToken) {
+    const more = document.createElement('li');
+    more.className = 'tree-item load-more-row';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'load-more';
+    button.textContent = 'Load more results';
+    button.onclick = () => searchDrive(state.searchQuery, {
+      append: true,
+      pageToken: state.searchNextPageToken,
+    });
+    more.appendChild(document.createElement('span'));
+    more.appendChild(button);
+    el.tree.appendChild(more);
+  }
+}
+
+function clearDriveSearch(loadCurrentFolder = true) {
+  if (state.searchController) state.searchController.abort();
+  state.searchRequest += 1;
+  state.searchQuery = '';
+  state.searchResults = [];
+  state.searchNextPageToken = null;
+  if (el.driveSearch) el.driveSearch.value = '';
+  if (el.clearSearchBtn) el.clearSearchBtn.classList.add('hidden');
+  if (loadCurrentFolder) loadFolder(folderIdForCurrentPath());
 }
 
 function renderBreadcrumb() {
@@ -518,6 +678,32 @@ el.refreshBtn.onclick = () => {
 
 el.syncBtn.onclick = startSync;
 el.trashBtn.onclick = moveSelectedToTrash;
+
+
+let searchTimer = null;
+el.driveSearch?.addEventListener('input', () => {
+  const term = el.driveSearch.value.trim();
+  if (el.clearSearchBtn) el.clearSearchBtn.classList.toggle('hidden', term.length === 0);
+  clearTimeout(searchTimer);
+
+  if (term.length === 0) {
+    clearDriveSearch(true);
+    return;
+  }
+
+  if (term.length < 2) return;
+  searchTimer = setTimeout(() => searchDrive(term), 300);
+});
+
+el.driveSearch?.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    clearTimeout(searchTimer);
+    searchDrive(el.driveSearch.value);
+  }
+});
+
+el.clearSearchBtn?.addEventListener('click', () => clearDriveSearch(true));
 
 document.addEventListener('mousemove', (event) => {
   if (!el.glow) return;

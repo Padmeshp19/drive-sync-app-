@@ -184,6 +184,61 @@ router.post('/trash', requireGoogleAuth, async (req, res) => {
   });
 });
 
+
+router.get('/search', requireGoogleAuth, async (req, res) => {
+  const drive = getDriveClient(req.session.googleTokens);
+  const term = String(req.query.q || '').trim();
+  const pageToken = req.query.pageToken || undefined;
+
+  if (!term) {
+    return res.json({ files: [], nextPageToken: null });
+  }
+
+  if (term.length > 200) {
+    return res.status(400).json({
+      error: 'Search text is too long',
+      detail: 'Keep the search to 200 characters or fewer.',
+    });
+  }
+
+  // Escape characters that have special meaning inside a Google Drive query string.
+  const escapedTerm = term.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+
+  try {
+    const result = await withBackoff(() =>
+      drive.files.list({
+        q: `name contains '${escapedTerm}' and trashed = false`,
+        spaces: 'drive',
+        corpora: 'user',
+        includeItemsFromAllDrives: true,
+        supportsAllDrives: true,
+        fields: 'nextPageToken, files(id, name, mimeType, size, modifiedTime)',
+        pageSize: 100,
+        pageToken,
+        orderBy: 'folder,name',
+      })
+    );
+
+    const files = (result.data.files || []).map((file) => ({
+      id: file.id,
+      name: file.name,
+      isFolder: file.mimeType === FOLDER_MIME,
+      size: file.size || null,
+      modifiedTime: file.modifiedTime,
+    }));
+
+    console.log(`Google Drive search: "${term}" found ${files.length} items`);
+    res.json({ files, nextPageToken: result.data.nextPageToken || null });
+  } catch (err) {
+    console.error('Drive search error:', err);
+    res.status(500).json({
+      error: 'Failed to search Drive',
+      detail: err.message,
+      code: err.code || err.response?.status || null,
+    });
+  }
+});
+
 router.post('/selection-size', requireGoogleAuth, async (req, res) => {
   const items = Array.isArray(req.body?.items) ? req.body.items : [];
 
