@@ -98,6 +98,76 @@ router.get('/list', requireGoogleAuth, async (req, res) => {
   }
 });
 
+const GOOGLE_EXPORTS = {
+  'application/vnd.google-apps.document': {
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    extension: '.docx',
+  },
+  'application/vnd.google-apps.spreadsheet': {
+    mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    extension: '.xlsx',
+  },
+  'application/vnd.google-apps.presentation': {
+    mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    extension: '.pptx',
+  },
+  'application/vnd.google-apps.drawing': {
+    mimeType: 'application/pdf',
+    extension: '.pdf',
+  },
+};
+
+function getExportInfo(mimeType) {
+  return GOOGLE_EXPORTS[mimeType] || null;
+}
+
+async function countStreamBytes(stream) {
+  let total = 0;
+  for await (const chunk of stream) {
+    total += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+  }
+  return total;
+}
+
+async function getTransferInfo(drive, file) {
+  if (file.size != null && Number.isFinite(Number(file.size))) {
+    return {
+      size: Number(file.size),
+      exported: false,
+      exportMimeType: null,
+      exportExtension: '',
+    };
+  }
+
+  const exportInfo = getExportInfo(file.mimeType);
+  if (!exportInfo) {
+    return {
+      size: null,
+      exported: false,
+      exportMimeType: null,
+      exportExtension: '',
+    };
+  }
+
+  const exported = await withBackoff(() =>
+    drive.files.export(
+      {
+        fileId: file.id,
+        mimeType: exportInfo.mimeType,
+      },
+      { responseType: 'stream' }
+    )
+  );
+
+  const size = await countStreamBytes(exported.data);
+  return {
+    size,
+    exported: true,
+    exportMimeType: exportInfo.mimeType,
+    exportExtension: exportInfo.extension,
+  };
+}
+
 async function collectFolderStats(drive, folderId, stats, visited) {
   if (visited.has(folderId)) return;
   visited.add(folderId);
@@ -117,7 +187,9 @@ async function collectFolderStats(drive, folderId, stats, visited) {
     if (stats.files.has(child.id)) continue;
 
     stats.files.set(child.id, {
+      id: child.id,
       name: child.name,
+      mimeType: child.mimeType,
       size: child.size == null ? null : Number(child.size),
     });
   }
@@ -241,6 +313,7 @@ router.post('/selection-size', requireGoogleAuth, async (req, res) => {
       totalBytes: 0,
       fileCount: 0,
       unknownSizeCount: 0,
+      exportedCount: 0,
     });
   }
 
@@ -267,7 +340,9 @@ router.post('/selection-size', requireGoogleAuth, async (req, res) => {
           await collectFolderStats(drive, item.id, stats, visitedFolders);
         } else {
           stats.files.set(item.id, {
+            id: item.id,
             name: result.data.name,
+            mimeType: result.data.mimeType,
             size: result.data.size == null ? null : Number(result.data.size),
           });
         }
@@ -276,19 +351,45 @@ router.post('/selection-size', requireGoogleAuth, async (req, res) => {
 
     let totalBytes = 0;
     let unknownSizeCount = 0;
+    let exportedCount = 0;
+    const files = Array.from(stats.files.values());
 
-    for (const file of stats.files.values()) {
-      if (Number.isFinite(file.size)) {
-        totalBytes += file.size;
-      } else {
-        unknownSizeCount += 1;
+    // Export Google-native files so their actual OneDrive transfer size is counted.
+    // A small concurrency limit keeps large selections responsive without hammering Drive.
+    const concurrency = 3;
+    let cursor = 0;
+
+    async function worker() {
+      while (true) {
+        const index = cursor++;
+        if (index >= files.length) return;
+
+        const file = files[index];
+        try {
+          const transfer = await getTransferInfo(drive, file);
+
+          if (Number.isFinite(transfer.size)) {
+            totalBytes += transfer.size;
+            if (transfer.exported) exportedCount += 1;
+          } else {
+            unknownSizeCount += 1;
+          }
+        } catch (fileErr) {
+          // One unsupported/too-large Google-native export should not make the
+          // whole selection size fail. Keep that file in the unknown bucket.
+          console.warn(`Could not determine transfer size for ${file.id}:`, fileErr.message);
+          unknownSizeCount += 1;
+        }
       }
     }
+
+    await Promise.all(Array.from({ length: Math.min(concurrency, files.length) }, worker));
 
     res.json({
       totalBytes,
       fileCount: stats.files.size,
       unknownSizeCount,
+      exportedCount,
     });
   } catch (err) {
     console.error('Drive selection size error:', err);

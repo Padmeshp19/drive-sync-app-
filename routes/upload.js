@@ -41,7 +41,7 @@ async function ensureMsToken(req) {
 // Pagination is handled so folders with more than one page of children are complete.
 async function walkDrive(drive, fileId, isFolder, relPath, out, visitedFolders = new Set()) {
   if (!isFolder) {
-    out.push({ id: fileId, relPath });
+    out.push({ id: fileId, relPath, mimeType: null });
     return;
   }
 
@@ -67,6 +67,7 @@ async function walkDrive(drive, fileId, isFolder, relPath, out, visitedFolders =
 
     for (const child of res.data.files || []) {
       const childIsFolder = child.mimeType === 'application/vnd.google-apps.folder';
+      const before = out.length;
       await walkDrive(
         drive,
         child.id,
@@ -75,10 +76,80 @@ async function walkDrive(drive, fileId, isFolder, relPath, out, visitedFolders =
         out,
         visitedFolders
       );
+      if (!childIsFolder) {
+        for (let i = before; i < out.length; i += 1) {
+          out[i].mimeType = child.mimeType;
+        }
+      }
     }
 
     pageToken = res.data.nextPageToken;
   } while (pageToken);
+}
+
+const GOOGLE_EXPORTS = {
+  'application/vnd.google-apps.document': {
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    extension: '.docx',
+  },
+  'application/vnd.google-apps.spreadsheet': {
+    mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    extension: '.xlsx',
+  },
+  'application/vnd.google-apps.presentation': {
+    mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    extension: '.pptx',
+  },
+  'application/vnd.google-apps.drawing': {
+    mimeType: 'application/pdf',
+    extension: '.pdf',
+  },
+};
+
+function getExportInfo(mimeType) {
+  return GOOGLE_EXPORTS[mimeType] || null;
+}
+
+async function getDriveFileStream(drive, file) {
+  const exportInfo = getExportInfo(file.mimeType);
+
+  if (exportInfo) {
+    const response = await withBackoff(() =>
+      drive.files.export(
+        { fileId: file.id, mimeType: exportInfo.mimeType },
+        { responseType: 'stream' }
+      )
+    );
+    return {
+      stream: response.data,
+      size: null,
+      exportExtension: exportInfo.extension,
+    };
+  }
+
+  const response = await withBackoff(() =>
+    drive.files.get(
+      { fileId: file.id, alt: 'media' },
+      { responseType: 'stream' }
+    )
+  );
+
+  return {
+    stream: response.data,
+    size: file.size == null ? null : Number(file.size),
+    exportExtension: '',
+  };
+}
+
+async function bufferStream(stream) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of stream) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    chunks.push(buf);
+    size += buf.length;
+  }
+  return { buffer: Buffer.concat(chunks, size), size };
 }
 
 // Upload one file's bytes into OneDrive at the given path. Uses resumable
@@ -189,11 +260,27 @@ router.post('/sync', requireAuth, async (req, res) => {
       const meta = await withBackoff(() =>
         drive.files.get({ fileId: file.id, fields: 'name, size, mimeType' })
       );
-      const dlStream = await withBackoff(() =>
-        drive.files.get({ fileId: file.id, alt: 'media' }, { responseType: 'stream' })
-      );
-      const oneDrivePath = `${dest}/${file.relPath}`;
-      await uploadToOneDrive(accessToken, oneDrivePath, dlStream.data, Number(meta.data.size));
+      const oneDrivePathBase = `${dest}/${file.relPath}`;
+      const transfer = await getDriveFileStream(drive, {
+        id: file.id,
+        mimeType: meta.data.mimeType,
+        size: meta.data.size == null ? null : Number(meta.data.size),
+      });
+
+      let oneDrivePath = oneDrivePathBase;
+      let stream = transfer.stream;
+      let size = transfer.size;
+
+      if (transfer.exportExtension) {
+        const buffered = await bufferStream(stream);
+        stream = require('stream').Readable.from(buffered.buffer);
+        size = buffered.size;
+        if (!oneDrivePath.toLowerCase().endsWith(transfer.exportExtension)) {
+          oneDrivePath += transfer.exportExtension;
+        }
+      }
+
+      await uploadToOneDrive(accessToken, oneDrivePath, stream, size);
       done += 1;
       send('progress', { done, total: flatFiles.length, current: file.relPath });
     }
