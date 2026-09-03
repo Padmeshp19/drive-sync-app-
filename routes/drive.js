@@ -30,27 +30,35 @@ async function withBackoff(fn, retries = 5, delay = 500) {
   }
 }
 
-async function listChildren(drive, parentId, fields) {
+async function listChildren(drive, parentId, fields, pageToken = undefined) {
+  const result = await withBackoff(() =>
+    drive.files.list({
+      q: `'${parentId}' in parents and trashed = false`,
+      spaces: 'drive',
+      corpora: 'user',
+      includeItemsFromAllDrives: true,
+      supportsAllDrives: true,
+      fields: `nextPageToken, files(${fields})`,
+      pageSize: 200,
+      pageToken,
+      orderBy: 'folder,name',
+    })
+  );
+
+  return {
+    files: result.data.files || [],
+    nextPageToken: result.data.nextPageToken || null,
+  };
+}
+
+async function listAllChildren(drive, parentId, fields) {
   const files = [];
   let pageToken;
 
   do {
-    const result = await withBackoff(() =>
-      drive.files.list({
-        q: `'${parentId}' in parents and trashed = false`,
-        spaces: 'drive',
-        corpora: 'user',
-        includeItemsFromAllDrives: true,
-        supportsAllDrives: true,
-        fields: `nextPageToken, files(${fields})`,
-        pageSize: 1000,
-        pageToken,
-        orderBy: 'folder,name',
-      })
-    );
-
-    files.push(...(result.data.files || []));
-    pageToken = result.data.nextPageToken;
+    const page = await listChildren(drive, parentId, fields, pageToken);
+    files.push(...page.files);
+    pageToken = page.nextPageToken;
   } while (pageToken);
 
   return files;
@@ -61,11 +69,12 @@ router.get('/list', requireGoogleAuth, async (req, res) => {
   const parentId = req.query.parentId || 'root';
 
   try {
-    const files = await listChildren(
+    const page = await listChildren(
       drive,
       parentId,
       'id, name, mimeType, size, modifiedTime'
     );
+    const files = page.files;
 
     const mapped = files.map((file) => ({
       id: file.id,
@@ -76,7 +85,7 @@ router.get('/list', requireGoogleAuth, async (req, res) => {
     }));
 
     console.log(`Google Drive: found ${mapped.length} items in ${parentId}`);
-    res.json({ files: mapped });
+    res.json({ files: mapped, nextPageToken: page.nextPageToken });
   } catch (err) {
     console.error('Drive list error:', err);
 
@@ -92,7 +101,7 @@ async function collectFolderStats(drive, folderId, stats, visited) {
   if (visited.has(folderId)) return;
   visited.add(folderId);
 
-  const children = await listChildren(
+  const children = await listAllChildren(
     drive,
     folderId,
     'id, name, mimeType, size'

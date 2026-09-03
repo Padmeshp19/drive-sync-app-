@@ -2,6 +2,9 @@ const state = {
   path: [{ id: 'root', name: 'My Drive' }],
   selected: new Map(), // id -> { id, name, isFolder, size }
   sizeRequest: 0,
+  folderRequest: 0,
+  folderCache: new Map(),
+  folderController: null,
 };
 
 const el = {
@@ -66,22 +69,37 @@ function setPill(pillEl, label, connected) {
   }
 }
 
-async function loadFolder(folderId) {
+async function loadFolder(folderId, options = {}) {
+  const requestId = ++state.folderRequest;
+  const cached = state.folderCache.get(folderId);
+
+  if (state.folderController) state.folderController.abort();
+
+  if (!options.force && cached) {
+    renderTree(cached.files || [], cached.nextPageToken, folderId);
+    return;
+  }
+
+  state.folderController = new AbortController();
   el.tree.innerHTML =
-    '<li class="tree-item"><span class="name" style="color:var(--text-dim)">Loading Drive…</span></li>';
+    '<li class="tree-item loading-row"><span class="loading-dot"></span><span class="name" style="color:var(--text-dim)">Loading Drive…</span></li>';
 
   try {
     const response = await fetch(
-      `/drive/list?parentId=${encodeURIComponent(folderId)}`
+      `/drive/list?parentId=${encodeURIComponent(folderId)}`,
+      { signal: state.folderController.signal }
     );
     const data = await response.json();
 
+    if (requestId !== state.folderRequest) return;
     if (!response.ok) {
       throw new Error(data.detail || data.error || `HTTP ${response.status}`);
     }
 
-    renderTree(data.files || []);
+    state.folderCache.set(folderId, data);
+    renderTree(data.files || [], data.nextPageToken, folderId);
   } catch (err) {
+    if (err.name === 'AbortError' || requestId !== state.folderRequest) return;
     console.error('Drive folder load error:', err);
     el.tree.innerHTML = `
       <li class="tree-item">
@@ -91,7 +109,7 @@ async function loadFolder(folderId) {
   }
 }
 
-function renderTree(files) {
+function renderTree(files, nextPageToken = null, folderId = folderIdForCurrentPath()) {
   el.tree.innerHTML = '';
   renderBreadcrumb();
 
@@ -112,6 +130,7 @@ function renderTree(files) {
       'aria-label',
       `Select ${file.name} for sync`
     );
+    checkbox.dataset.fileId = file.id;
 
     checkbox.onchange = () => {
       if (checkbox.checked) {
@@ -142,6 +161,44 @@ function renderTree(files) {
     li.appendChild(checkbox);
     li.appendChild(name);
     el.tree.appendChild(li);
+  }
+
+  if (nextPageToken) {
+    const more = document.createElement('li');
+    more.className = 'tree-item load-more-row';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'load-more';
+    button.textContent = 'Load more items';
+    button.onclick = () => loadMore(folderId, nextPageToken);
+    more.appendChild(document.createElement('span'));
+    more.appendChild(button);
+    el.tree.appendChild(more);
+  }
+}
+
+function folderIdForCurrentPath() {
+  return state.path[state.path.length - 1].id;
+}
+
+async function loadMore(folderId, pageToken) {
+  try {
+    const response = await fetch(
+      `/drive/list?parentId=${encodeURIComponent(folderId)}&pageToken=${encodeURIComponent(pageToken)}`
+    );
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+    }
+    const cached = state.folderCache.get(folderId) || { files: [] };
+    const merged = {
+      files: [...(cached.files || []), ...(data.files || [])],
+      nextPageToken: data.nextPageToken || null,
+    };
+    state.folderCache.set(folderId, merged);
+    renderTree(merged.files, merged.nextPageToken, folderId);
+  } catch (err) {
+    console.error('Load more error:', err);
   }
 }
 
@@ -221,19 +278,8 @@ function renderSelectedList() {
 
 function updateVisibleCheckboxes() {
   el.tree.querySelectorAll('input[type="checkbox"]').forEach((checkbox) => {
-    const nameEl = checkbox.parentElement?.querySelector('.name');
-    if (!nameEl) return;
-
-    const visibleName = nameEl.textContent;
-    const match = Array.from(state.selected.values()).find(
-      (item) => item.name === visibleName
-    );
-
-    if (match) checkbox.checked = true;
+    checkbox.checked = state.selected.has(checkbox.dataset.fileId);
   });
-
-  // Reloading the current folder guarantees exact checkbox state when duplicate names exist.
-  loadFolder(state.path[state.path.length - 1].id);
 }
 
 async function updateSelectionSize() {
@@ -391,7 +437,8 @@ async function startSync() {
 }
 
 el.refreshBtn.onclick = () => {
-  loadFolder(state.path[state.path.length - 1].id);
+  state.folderCache.delete(folderIdForCurrentPath());
+  loadFolder(folderIdForCurrentPath(), { force: true });
 };
 
 el.syncBtn.onclick = startSync;
