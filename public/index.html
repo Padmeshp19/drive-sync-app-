@@ -127,7 +127,10 @@
           <div id="progressWrap" class="progress-wrap hidden">
             <div class="progress-heading">
               <span>SYNC PROGRESS</span>
-              <span id="progressText">Starting…</span>
+              <div class="progress-actions">
+                <span id="progressText">Starting…</span>
+                <button id="cancelSyncBtn" class="cancel-sync-btn hidden" type="button">Cancel sync</button>
+              </div>
             </div>
             <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
             <ul id="log" class="log"></ul>

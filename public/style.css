@@ -1034,3 +1034,51 @@ button { -webkit-tap-highlight-color: transparent; }
     scroll-behavior: auto !important;
   }
 }
+
+
+/* Sync cancellation */
+.progress-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  min-width: 0;
+}
+
+.cancel-sync-btn {
+  border: 1px solid rgba(251, 113, 133, 0.45);
+  background: rgba(251, 113, 133, 0.08);
+  color: #fda4af;
+  border-radius: 999px;
+  padding: 5px 10px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 160ms ease, background-color 160ms ease, border-color 160ms ease, opacity 160ms ease;
+}
+
+.cancel-sync-btn:hover {
+  transform: translateY(-1px);
+  background: rgba(251, 113, 133, 0.15);
+  border-color: rgba(251, 113, 133, 0.7);
+}
+
+.cancel-sync-btn:active {
+  transform: translateY(0);
+}
+
+.cancel-sync-btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+@media (max-width: 640px) {
+  .progress-actions {
+    gap: 8px;
+  }
+  .cancel-sync-btn {
+    padding: 4px 8px;
+    font-size: 10px;
+  }
+}

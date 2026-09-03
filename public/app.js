@@ -12,6 +12,8 @@ const state = {
   searchNextPageToken: null,
   selectAllBusy: false,
   selectAllController: null,
+  syncController: null,
+  syncActive: false,
 };
 
 const el = {
@@ -36,6 +38,7 @@ const el = {
   clearSearchBtn: document.getElementById('clearSearchBtn'),
   selectAllBtn: document.getElementById('selectAllBtn'),
   titleType: document.getElementById('titleType'),
+  cancelSyncBtn: document.getElementById('cancelSyncBtn'),
 };
 
 function formatBytes(bytes) {
@@ -741,13 +744,22 @@ async function moveSelectedToTrash() {
 
 async function startSync() {
   const items = Array.from(state.selected.values());
-  if (items.length === 0) return;
+  if (items.length === 0 || state.syncActive) return;
 
+  state.syncActive = true;
+  state.syncController = new AbortController();
   el.syncBtn.disabled = true;
+  el.trashBtn.disabled = true;
+  el.selectAllBtn && (el.selectAllBtn.disabled = true);
   el.progressWrap.classList.remove('hidden');
   el.progressFill.style.width = '0%';
   el.progressText.textContent = 'Starting…';
   el.log.innerHTML = '';
+  if (el.cancelSyncBtn) {
+    el.cancelSyncBtn.classList.remove('hidden');
+    el.cancelSyncBtn.disabled = false;
+    el.cancelSyncBtn.textContent = 'Cancel sync';
+  }
 
   const destFolder = el.destFolder.value.trim() || 'DriveSync';
 
@@ -756,6 +768,7 @@ async function startSync() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ items, destFolder }),
+      signal: state.syncController.signal,
     });
 
     if (!resp.ok || !resp.body) {
@@ -791,20 +804,14 @@ async function startSync() {
             : 100;
           el.progressFill.style.width = `${pct}%`;
           el.progressText.textContent = `${data.done} / ${data.total}`;
-          if (data.skipped) {
-            addLog(`⚠ Skipped: ${data.current} — ${data.reason}`, 'err');
-          } else {
-            addLog(`✓ ${data.current}`, 'ok');
-          }
+          addLog(`✓ ${data.current}`, 'ok');
         } else if (eventType === 'complete') {
           el.progressFill.style.width = '100%';
-          if (data.skipped) {
-            el.progressText.textContent = `Done — ${data.done - data.skipped} synced, ${data.skipped} skipped`;
-            addLog(`Sync complete. ${data.skipped} item(s) could not be transferred.`, 'err');
-          } else {
-            el.progressText.textContent = `Done — ${data.done} files synced`;
-            addLog('Sync complete.', 'ok');
-          }
+          el.progressText.textContent = `Done — ${data.done} files synced`;
+          addLog('Sync complete.', 'ok');
+        } else if (eventType === 'cancelled') {
+          el.progressText.textContent = 'Sync cancelled';
+          addLog('Sync cancelled by user.', 'err');
         } else if (eventType === 'error') {
           addLog(`Error: ${data.message}`, 'err');
           el.progressText.textContent = 'Sync failed — see log';
@@ -812,13 +819,36 @@ async function startSync() {
       }
     }
   } catch (err) {
-    console.error('Sync error:', err);
-    addLog(`Error: ${err.message}`, 'err');
-    el.progressText.textContent = 'Sync failed — see log';
+    if (err.name === 'AbortError') {
+      el.progressText.textContent = 'Sync cancelled';
+      addLog('Sync cancelled by user.', 'err');
+    } else {
+      console.error('Sync error:', err);
+      addLog(`Error: ${err.message}`, 'err');
+      el.progressText.textContent = 'Sync failed — see log';
+    }
   } finally {
+    state.syncActive = false;
+    state.syncController = null;
+    if (el.cancelSyncBtn) {
+      el.cancelSyncBtn.classList.add('hidden');
+      el.cancelSyncBtn.disabled = false;
+    }
     el.syncBtn.disabled = state.selected.size === 0;
+    el.trashBtn.disabled = state.selected.size === 0;
+    updateSelectAllButton();
     setSyncButtonText();
   }
+}
+
+function cancelSync() {
+  if (!state.syncActive || !state.syncController) return;
+  if (el.cancelSyncBtn) {
+    el.cancelSyncBtn.disabled = true;
+    el.cancelSyncBtn.textContent = 'Cancelling…';
+  }
+  el.progressText.textContent = 'Cancelling…';
+  state.syncController.abort();
 }
 
 el.refreshBtn.onclick = () => {
@@ -827,6 +857,7 @@ el.refreshBtn.onclick = () => {
 };
 
 el.syncBtn.onclick = startSync;
+el.cancelSyncBtn?.addEventListener('click', cancelSync);
 el.trashBtn.onclick = moveSelectedToTrash;
 el.selectAllBtn?.addEventListener('click', selectAllCurrentView);
 
