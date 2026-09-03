@@ -37,23 +37,48 @@ async function ensureMsToken(req) {
   return fresh.access_token;
 }
 
-// Recursively walk a Drive folder, collecting a flat file list with relative paths
-async function walkDrive(drive, fileId, isFolder, relPath, out) {
+// Recursively walk a Drive folder, collecting a flat file list with relative paths.
+// Pagination is handled so folders with more than one page of children are complete.
+async function walkDrive(drive, fileId, isFolder, relPath, out, visitedFolders = new Set()) {
   if (!isFolder) {
     out.push({ id: fileId, relPath });
     return;
   }
-  const res = await withBackoff(() =>
-    drive.files.list({
-      q: `'${fileId}' in parents and trashed = false`,
-      fields: 'files(id, name, mimeType)',
-      pageSize: 1000,
-    })
-  );
-  for (const child of res.data.files) {
-    const childIsFolder = child.mimeType === 'application/vnd.google-apps.folder';
-    await walkDrive(drive, child.id, childIsFolder, `${relPath}/${child.name}`, out);
-  }
+
+  if (visitedFolders.has(fileId)) return;
+  visitedFolders.add(fileId);
+
+  let pageToken;
+
+  do {
+    const res = await withBackoff(() =>
+      drive.files.list({
+        q: `'${fileId}' in parents and trashed = false`,
+        spaces: 'drive',
+        corpora: 'user',
+        includeItemsFromAllDrives: true,
+        supportsAllDrives: true,
+        fields: 'nextPageToken, files(id, name, mimeType)',
+        pageSize: 1000,
+        pageToken,
+        orderBy: 'folder,name',
+      })
+    );
+
+    for (const child of res.data.files || []) {
+      const childIsFolder = child.mimeType === 'application/vnd.google-apps.folder';
+      await walkDrive(
+        drive,
+        child.id,
+        childIsFolder,
+        `${relPath}/${child.name}`,
+        out,
+        visitedFolders
+      );
+    }
+
+    pageToken = res.data.nextPageToken;
+  } while (pageToken);
 }
 
 // Upload one file's bytes into OneDrive at the given path. Uses resumable
@@ -141,9 +166,21 @@ router.post('/sync', requireAuth, async (req, res) => {
 
   try {
     const flatFiles = [];
+    const seenFiles = new Set();
+
     for (const item of items) {
-      await walkDrive(drive, item.id, item.isFolder, item.name, flatFiles);
+      const collected = [];
+      await walkDrive(drive, item.id, item.isFolder, item.name, collected);
+
+      for (const file of collected) {
+        // If the user selects both a folder and one of its children, do not sync
+        // the same Drive file twice.
+        if (seenFiles.has(file.id)) continue;
+        seenFiles.add(file.id);
+        flatFiles.push(file);
+      }
     }
+
     send('start', { total: flatFiles.length });
 
     let done = 0;
