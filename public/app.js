@@ -615,19 +615,13 @@ async function updateSelectionSize() {
     el.selectionSize.textContent = formatBytes(Number(data.totalBytes) || 0);
     el.sizeTrackFill.style.width = data.fileCount > 0 ? '100%' : '0%';
 
-    const summaryParts = [
-      `${items.length} item${items.length === 1 ? '' : 's'}`,
-      `${data.fileCount} file${data.fileCount === 1 ? '' : 's'}`,
-    ];
-
-    if (Number(data.exportedCount) > 0) {
-      summaryParts.push(`${data.exportedCount} Google file${data.exportedCount === 1 ? '' : 's'} exported`);
+    if (data.unknownSizeCount > 0) {
+      el.selectionSummary.textContent =
+        `${items.length} item${items.length === 1 ? '' : 's'} · ${data.fileCount} file${data.fileCount === 1 ? '' : 's'} · ${data.unknownSizeCount} without size`;
+    } else {
+      el.selectionSummary.textContent =
+        `${items.length} item${items.length === 1 ? '' : 's'} · ${data.fileCount} file${data.fileCount === 1 ? '' : 's'}`;
     }
-    if (Number(data.unknownSizeCount) > 0) {
-      summaryParts.push(`${data.unknownSizeCount} without transferable size`);
-    }
-
-    el.selectionSummary.textContent = summaryParts.join(' · ');
 
     setSyncButtonText();
   } catch (err) {
