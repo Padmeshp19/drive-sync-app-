@@ -31,7 +31,7 @@
     <main>
       <section class="hero">
         <p class="eyebrow">CLOUD SYNC</p>
-        <h1><span class="title-slide">Move your files.</span><br /><span class="title-type">Without the mess.</span></h1>
+        <h1 aria-label="Move your files. Without the mess."><span class="title-slide">Move your files.</span><br /><span class="title-type" id="titleType"></span><span class="title-cursor" aria-hidden="true">|</span></h1>
         <p class="hero-copy">Select folders or files from Google Drive and send them straight to OneDrive.</p>
       </section>
 
@@ -42,7 +42,10 @@
               <p class="panel-kicker">SOURCE</p>
               <h2>Google Drive</h2>
             </div>
-            <button id="refreshBtn" class="icon-btn" title="Refresh Drive" aria-label="Refresh Drive">↻</button>
+            <div class="drive-heading-actions">
+              <button id="selectAllBtn" class="select-all-btn" type="button" aria-pressed="false">Select all</button>
+              <button id="refreshBtn" class="icon-btn" title="Refresh Drive" aria-label="Refresh Drive">↻</button>
+            </div>
           </div>
 
           <div class="drive-search">

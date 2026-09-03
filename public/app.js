@@ -32,6 +32,8 @@ const el = {
   glow: document.getElementById('glow'),
   driveSearch: document.getElementById('driveSearch'),
   clearSearchBtn: document.getElementById('clearSearchBtn'),
+  selectAllBtn: document.getElementById('selectAllBtn'),
+  titleType: document.getElementById('titleType'),
 };
 
 function formatBytes(bytes) {
@@ -124,6 +126,53 @@ async function loadFolder(folderId, options = {}) {
   }
 }
 
+function currentVisibleFiles() {
+  if (state.searchQuery) return state.searchResults;
+  const cached = state.folderCache.get(folderIdForCurrentPath());
+  return cached?.files || [];
+}
+
+function updateSelectAllButton() {
+  if (!el.selectAllBtn) return;
+
+  const files = currentVisibleFiles();
+  const selectedCount = files.filter((file) => state.selected.has(file.id)).length;
+  const allSelected = files.length > 0 && selectedCount === files.length;
+  const someSelected = selectedCount > 0 && !allSelected;
+
+  el.selectAllBtn.textContent = allSelected ? 'Clear all' : 'Select all';
+  el.selectAllBtn.classList.toggle('active', allSelected);
+  el.selectAllBtn.classList.toggle('partial', someSelected);
+  el.selectAllBtn.setAttribute('aria-pressed', String(allSelected));
+  el.selectAllBtn.disabled = files.length === 0;
+}
+
+async function selectAllCurrentView() {
+  if (!el.selectAllBtn) return;
+
+  const visible = currentVisibleFiles();
+  if (visible.length === 0) return;
+
+  const allSelected = visible.every((file) => state.selected.has(file.id));
+  if (allSelected) {
+    visible.forEach((file) => state.selected.delete(file.id));
+  } else {
+    visible.forEach((file) => {
+      state.selected.set(file.id, {
+        id: file.id,
+        name: file.name,
+        isFolder: file.isFolder,
+        size: file.size,
+      });
+    });
+  }
+
+  updateVisibleCheckboxes();
+  renderSelectedList();
+  updateSelectionSize();
+  updateSelectAllButton();
+}
+
 function renderTree(files, nextPageToken = null, folderId = folderIdForCurrentPath()) {
   el.tree.innerHTML = '';
   renderBreadcrumb();
@@ -131,6 +180,7 @@ function renderTree(files, nextPageToken = null, folderId = folderIdForCurrentPa
   if (files.length === 0) {
     el.tree.innerHTML =
       '<li class="tree-item"><span class="name" style="color:var(--text-dim)">This folder is empty.</span></li>';
+    updateSelectAllButton();
     return;
   }
 
@@ -160,6 +210,7 @@ function renderTree(files, nextPageToken = null, folderId = folderIdForCurrentPa
       }
       renderSelectedList();
       updateSelectionSize();
+      updateSelectAllButton();
     };
 
     const name = document.createElement('span');
@@ -190,6 +241,8 @@ function renderTree(files, nextPageToken = null, folderId = folderIdForCurrentPa
     more.appendChild(button);
     el.tree.appendChild(more);
   }
+
+  updateSelectAllButton();
 }
 
 function folderIdForCurrentPath() {
@@ -286,6 +339,7 @@ function renderSearchResults() {
   if (state.searchResults.length === 0) {
     el.tree.innerHTML =
       '<li class="tree-item"><span class="name" style="color:var(--text-dim)">No matching files or folders found.</span></li>';
+    updateSelectAllButton();
     return;
   }
 
@@ -311,6 +365,7 @@ function renderSearchResults() {
       }
       renderSelectedList();
       updateSelectionSize();
+      updateSelectAllButton();
     };
 
     const name = document.createElement('span');
@@ -350,6 +405,8 @@ function renderSearchResults() {
     more.appendChild(button);
     el.tree.appendChild(more);
   }
+
+  updateSelectAllButton();
 }
 
 function clearDriveSearch(loadCurrentFolder = true) {
@@ -418,6 +475,7 @@ function renderSelectedList() {
         renderSelectedList();
         updateVisibleCheckboxes();
         updateSelectionSize();
+        updateSelectAllButton();
       };
 
       row.appendChild(label);
@@ -678,7 +736,7 @@ el.refreshBtn.onclick = () => {
 
 el.syncBtn.onclick = startSync;
 el.trashBtn.onclick = moveSelectedToTrash;
-
+el.selectAllBtn?.addEventListener('click', selectAllCurrentView);
 
 let searchTimer = null;
 el.driveSearch?.addEventListener('input', () => {
@@ -716,6 +774,21 @@ function escapeHtml(value) {
   div.textContent = String(value);
   return div.innerHTML;
 }
+
+/* NoteVault-style title animation: slide the first line, then type the second. */
+const titleText = 'Without the mess.';
+let titleIndex = 0;
+function typeMainTitle() {
+  if (!el.titleType) return;
+  if (titleIndex < titleText.length) {
+    el.titleType.textContent += titleText[titleIndex];
+    titleIndex += 1;
+    setTimeout(typeMainTitle, 45);
+  } else {
+    el.titleType.classList.add('typed');
+  }
+}
+setTimeout(typeMainTitle, 1050);
 
 checkStatus();
 renderSelectedList();
