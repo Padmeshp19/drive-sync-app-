@@ -16,6 +16,21 @@ const state = {
   syncActive: false,
 };
 
+
+let toastTimer = null;
+function showToast(message, type = 'success') {
+  const toast = document.getElementById('toast');
+  if (!toast) return;
+  toast.textContent = message;
+  toast.className = `toast ${type}`;
+  void toast.offsetWidth;
+  toast.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    toast.classList.remove('show');
+  }, 4000);
+}
+
 const el = {
   tree: document.getElementById('tree'),
   breadcrumb: document.getElementById('breadcrumb'),
@@ -39,23 +54,7 @@ const el = {
   selectAllBtn: document.getElementById('selectAllBtn'),
   titleType: document.getElementById('titleType'),
   cancelSyncBtn: document.getElementById('cancelSyncBtn'),
-  toast: document.getElementById('toast'),
-  toastMessage: document.getElementById('toastMessage'),
 };
-
-let toastTimer = null;
-
-function showToast(message, type = 'success') {
-  if (!el.toast || !el.toastMessage) return;
-  el.toastMessage.textContent = message;
-  el.toast.className = `sync-toast ${type}`;
-  void el.toast.offsetWidth;
-  el.toast.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => {
-    el.toast.classList.remove('show');
-  }, 4000);
-}
 
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 GB';
@@ -823,20 +822,26 @@ async function startSync() {
           addLog(`✓ ${data.current}`, 'ok');
         } else if (eventType === 'complete') {
           el.progressFill.style.width = '100%';
-          el.progressText.textContent = `Done — ${data.done} files synced`;
-          addLog('Sync complete.', 'ok');
+          const skipped = Number(data.skipped) || 0;
+          el.progressText.textContent = skipped
+            ? `Done — ${data.done - skipped} synced, ${skipped} skipped`
+            : `Done — ${data.done} files synced`;
+          addLog(skipped ? `Sync complete — ${skipped} skipped.` : 'Sync complete.', skipped ? 'err' : 'ok');
+          showToast(skipped ? `Sync completed with ${skipped} skipped item${skipped === 1 ? '' : 's'}.` : 'Sync completed successfully.', skipped ? 'info' : 'success');
         } else if (eventType === 'cancelled') {
           el.progressText.textContent = 'Sync cancelled';
           addLog('Sync cancelled by user.', 'err');
+          if (el.cancelSyncBtn) el.cancelSyncBtn.classList.add('hidden');
           showToast('Sync cancelled successfully', 'success');
         } else if (eventType === 'error') {
           addLog(`Error: ${data.message}`, 'err');
           el.progressText.textContent = 'Sync failed — see log';
           if (el.cancelSyncBtn) {
             el.cancelSyncBtn.classList.add('hidden');
-            el.cancelSyncBtn.disabled = true;
+            el.cancelSyncBtn.disabled = false;
+            el.cancelSyncBtn.textContent = 'Cancel sync';
           }
-          showToast('Sync failed — nothing is currently syncing', 'error');
+          showToast('Sync failed — see log', 'error');
         }
       }
     }
@@ -849,7 +854,7 @@ async function startSync() {
       console.error('Sync error:', err);
       addLog(`Error: ${err.message}`, 'err');
       el.progressText.textContent = 'Sync failed — see log';
-      showToast('Sync failed — nothing is currently syncing', 'error');
+      showToast('Sync failed — see log', 'error');
     }
   } finally {
     state.syncActive = false;
@@ -866,12 +871,7 @@ async function startSync() {
 }
 
 function cancelSync() {
-  if (!state.syncActive || !state.syncController) {
-    if (el.cancelSyncBtn) el.cancelSyncBtn.classList.add('hidden');
-    showToast('Sync is already stopped', 'info');
-    return;
-  }
-
+  if (!state.syncActive || !state.syncController) return;
   if (el.cancelSyncBtn) {
     el.cancelSyncBtn.disabled = true;
     el.cancelSyncBtn.textContent = 'Cancelling…';
