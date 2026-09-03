@@ -10,6 +10,8 @@ const state = {
   searchQuery: '',
   searchResults: [],
   searchNextPageToken: null,
+  selectAllBusy: false,
+  selectAllController: null,
 };
 
 const el = {
@@ -147,17 +149,81 @@ function updateSelectAllButton() {
   el.selectAllBtn.disabled = files.length === 0;
 }
 
+async function fetchAllFolderItems(folderId, signal) {
+  const all = [];
+  let pageToken = null;
+  do {
+    const params = new URLSearchParams({ parentId: folderId });
+    if (pageToken) params.set('pageToken', pageToken);
+    const response = await fetch(`/drive/list?${params.toString()}`, { signal });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+    }
+    all.push(...(data.files || []));
+    pageToken = data.nextPageToken || null;
+  } while (pageToken);
+  return all;
+}
+
+async function fetchAllSearchItems(signal) {
+  const all = [];
+  let pageToken = null;
+  do {
+    const params = new URLSearchParams({ q: state.searchQuery });
+    if (pageToken) params.set('pageToken', pageToken);
+    const response = await fetch(`/drive/search?${params.toString()}`, { signal });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+    }
+    all.push(...(data.files || []));
+    pageToken = data.nextPageToken || null;
+  } while (pageToken);
+  return all;
+}
+
 async function selectAllCurrentView() {
-  if (!el.selectAllBtn) return;
+  if (!el.selectAllBtn || state.selectAllBusy) return;
 
-  const visible = currentVisibleFiles();
-  if (visible.length === 0) return;
+  const initial = currentVisibleFiles();
+  if (initial.length === 0) return;
 
-  const allSelected = visible.every((file) => state.selected.has(file.id));
-  if (allSelected) {
-    visible.forEach((file) => state.selected.delete(file.id));
-  } else {
-    visible.forEach((file) => {
+  const alreadyFullyLoaded = state.searchQuery
+    ? !state.searchNextPageToken
+    : !(state.folderCache.get(folderIdForCurrentPath())?.nextPageToken);
+  const allKnownSelected = initial.every((file) => state.selected.has(file.id));
+
+  if (alreadyFullyLoaded && allKnownSelected) {
+    initial.forEach((file) => state.selected.delete(file.id));
+    state.selectionStats = null;
+    renderSelectedList();
+    updateVisibleCheckboxes();
+    updateSelectionSize();
+    updateSelectAllButton();
+    return;
+  }
+
+  state.selectAllBusy = true;
+  el.selectAllBtn.disabled = true;
+  el.selectAllBtn.textContent = 'Selecting…';
+  if (state.selectAllController) state.selectAllController.abort();
+  state.selectAllController = new AbortController();
+
+  try {
+    const all = state.searchQuery
+      ? await fetchAllSearchItems(state.selectAllController.signal)
+      : await fetchAllFolderItems(folderIdForCurrentPath(), state.selectAllController.signal);
+
+    if (!state.searchQuery) {
+      const folderId = folderIdForCurrentPath();
+      state.folderCache.set(folderId, { files: all, nextPageToken: null });
+    } else {
+      state.searchResults = all;
+      state.searchNextPageToken = null;
+    }
+
+    all.forEach((file) => {
       state.selected.set(file.id, {
         id: file.id,
         name: file.name,
@@ -165,12 +231,23 @@ async function selectAllCurrentView() {
         size: file.size,
       });
     });
-  }
 
-  updateVisibleCheckboxes();
-  renderSelectedList();
-  updateSelectionSize();
-  updateSelectAllButton();
+    if (state.searchQuery) renderSearchResults();
+    else renderTree(all, null, folderIdForCurrentPath());
+
+    renderSelectedList();
+    updateSelectionSize();
+    updateSelectAllButton();
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      console.error('Select all error:', err);
+      el.selectAllBtn.textContent = 'Select all';
+    }
+  } finally {
+    state.selectAllBusy = false;
+    state.selectAllController = null;
+    updateSelectAllButton();
+  }
 }
 
 function renderTree(files, nextPageToken = null, folderId = folderIdForCurrentPath()) {
@@ -763,10 +840,21 @@ el.driveSearch?.addEventListener('keydown', (event) => {
 
 el.clearSearchBtn?.addEventListener('click', () => clearDriveSearch(true));
 
+let glowFrame = 0;
+let glowX = 0;
+let glowY = 0;
+
 document.addEventListener('mousemove', (event) => {
   if (!el.glow) return;
-  el.glow.style.left = `${event.clientX}px`;
-  el.glow.style.top = `${event.clientY}px`;
+  glowX = event.clientX;
+  glowY = event.clientY;
+  if (glowFrame) return;
+  glowFrame = requestAnimationFrame(() => {
+    el.glow.style.left = '0';
+    el.glow.style.top = '0';
+    el.glow.style.transform = `translate3d(${glowX}px, ${glowY}px, 0) translate(-50%, -50%)`;
+    glowFrame = 0;
+  });
 });
 
 function escapeHtml(value) {
@@ -788,7 +876,7 @@ function typeMainTitle() {
     el.titleType.classList.add('typed');
   }
 }
-setTimeout(typeMainTitle, 1050);
+setTimeout(typeMainTitle, 1200);
 
 checkStatus();
 renderSelectedList();

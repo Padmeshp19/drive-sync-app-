@@ -72,7 +72,8 @@ router.get('/list', requireGoogleAuth, async (req, res) => {
     const page = await listChildren(
       drive,
       parentId,
-      'id, name, mimeType, size, modifiedTime'
+      'id, name, mimeType, size, modifiedTime',
+      req.query.pageToken || undefined
     );
     const files = page.files;
 
@@ -129,13 +130,6 @@ router.post('/trash', requireGoogleAuth, async (req, res) => {
     return res.status(400).json({
       error: 'No items selected',
       detail: 'Select at least one file or folder to move to Trash.',
-    });
-  }
-
-  if (items.length > 100) {
-    return res.status(400).json({
-      error: 'Too many selected items',
-      detail: 'Select 100 items or fewer at a time.',
     });
   }
 
@@ -247,13 +241,6 @@ router.post('/selection-size', requireGoogleAuth, async (req, res) => {
       totalBytes: 0,
       fileCount: 0,
       unknownSizeCount: 0,
-    });
-  }
-
-  if (items.length > 100) {
-    return res.status(400).json({
-      error: 'Too many selected items',
-      detail: 'Select 100 items or fewer at a time.',
     });
   }
 
