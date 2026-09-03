@@ -271,6 +271,24 @@ async function bufferStream(stream, signal = null) {
   return { buffer: Buffer.concat(chunks, size), size };
 }
 
+async function oneDriveItemExists(accessToken, oneDrivePath, signal) {
+  const encodedPath = oneDrivePath.split('/').map(encodeURIComponent).join('/');
+  try {
+    const response = await withBackoff(() => axios.get(
+      `https://graph.microsoft.com/v1.0/me/drive/root:/${encodedPath}`,
+      {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        params: { '$select': 'id,name,file,folder,size,lastModifiedDateTime' },
+        signal,
+      }
+    ), 3, 400, signal);
+    return response.status === 200 && Boolean(response.data?.id);
+  } catch (err) {
+    if (err.response?.status === 404) return false;
+    throw err;
+  }
+}
+
 async function uploadToOneDrive(accessToken, oneDrivePath, stream, sizeBytes, signal) {
   const encodedPath = oneDrivePath.split('/').map(encodeURIComponent).join('/');
 
@@ -390,6 +408,7 @@ router.post('/sync', requireAuth, async (req, res) => {
 
     let done = 0;
     let skipped = 0;
+    let existing = 0;
 
     for (const file of flatFiles) {
       if (syncController.signal.aborted) throw new Error('Sync cancelled');
@@ -424,12 +443,32 @@ router.post('/sync', requireAuth, async (req, res) => {
         let size = transfer.size;
 
         if (transfer.exportExtension) {
-          const buffered = await bufferStream(stream, syncController.signal);
-          stream = Readable.from(buffered.buffer);
-          size = buffered.size;
           if (!oneDrivePath.toLowerCase().endsWith(transfer.exportExtension)) {
             oneDrivePath += transfer.exportExtension;
           }
+        }
+
+        // Resume-safe behavior: never upload the same destination path twice.
+        // This makes a cancelled sync safe to run again.
+        if (await oneDriveItemExists(accessToken, oneDrivePath, syncController.signal)) {
+          done += 1;
+          existing += 1;
+          send('progress', {
+            done,
+            total: flatFiles.length,
+            current: file.relPath,
+            skipped: true,
+            existing: true,
+            reason: 'Already exists in OneDrive — skipped',
+          });
+          continue;
+        }
+
+        // Only export/buffer after confirming the destination is missing.
+        if (transfer.exportExtension) {
+          const buffered = await bufferStream(stream, syncController.signal);
+          stream = Readable.from(buffered.buffer);
+          size = buffered.size;
         }
 
         await uploadToOneDrive(accessToken, oneDrivePath, stream, size, syncController.signal);
@@ -451,7 +490,7 @@ router.post('/sync', requireAuth, async (req, res) => {
       }
     }
 
-    send('complete', { done, total: flatFiles.length, skipped });
+    send('complete', { done, total: flatFiles.length, skipped, existing });
   } catch (err) {
     if (syncController.signal.aborted || clientDisconnected || isAbortLike(err)) {
       if (!clientDisconnected) send('cancelled', { message: 'Sync cancelled' });

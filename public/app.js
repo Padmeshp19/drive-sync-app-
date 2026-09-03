@@ -819,15 +819,38 @@ async function startSync() {
             : 100;
           el.progressFill.style.width = `${pct}%`;
           el.progressText.textContent = `${data.done} / ${data.total}`;
-          addLog(`✓ ${data.current}`, 'ok');
+          if (data.existing) {
+            addLog(`↻ ${data.current} — already exists in OneDrive, skipped`, 'info');
+          } else if (data.skipped) {
+            addLog(`⚠ Skipped: ${data.current} — ${data.reason || 'unsupported'}`, 'err');
+          } else {
+            addLog(`✓ ${data.current}`, 'ok');
+          }
         } else if (eventType === 'complete') {
           el.progressFill.style.width = '100%';
           const skipped = Number(data.skipped) || 0;
-          el.progressText.textContent = skipped
-            ? `Done — ${data.done - skipped} synced, ${skipped} skipped`
-            : `Done — ${data.done} files synced`;
-          addLog(skipped ? `Sync complete — ${skipped} skipped.` : 'Sync complete.', skipped ? 'err' : 'ok');
-          showToast(skipped ? `Sync completed with ${skipped} skipped item${skipped === 1 ? '' : 's'}.` : 'Sync completed successfully.', skipped ? 'info' : 'success');
+          const existing = Number(data.existing) || 0;
+          const uploaded = Math.max(0, Number(data.done) - skipped);
+          const nonExistingSkipped = Math.max(0, skipped - existing);
+          el.progressText.textContent = existing
+            ? `Done — ${uploaded} synced, ${existing} already existed${nonExistingSkipped ? `, ${nonExistingSkipped} skipped` : ''}`
+            : skipped
+              ? `Done — ${uploaded} synced, ${skipped} skipped`
+              : `Done — ${data.done} files synced`;
+          addLog(
+            existing || skipped
+              ? `Sync complete — ${uploaded} synced, ${existing} already existed${nonExistingSkipped ? `, ${nonExistingSkipped} skipped` : ''}.`
+              : 'Sync complete.',
+            skipped ? 'info' : 'ok'
+          );
+          showToast(
+            existing
+              ? `Sync completed — ${uploaded} uploaded, ${existing} already existed and were skipped.`
+              : skipped
+                ? `Sync completed with ${skipped} skipped item${skipped === 1 ? '' : 's'}.`
+                : 'Sync completed successfully.',
+            skipped ? 'info' : 'success'
+          );
         } else if (eventType === 'cancelled') {
           el.progressText.textContent = 'Sync cancelled';
           addLog('Sync cancelled by user.', 'err');
@@ -862,6 +885,7 @@ async function startSync() {
     if (el.cancelSyncBtn) {
       el.cancelSyncBtn.classList.add('hidden');
       el.cancelSyncBtn.disabled = false;
+      el.cancelSyncBtn.textContent = 'Cancel sync';
     }
     el.syncBtn.disabled = state.selected.size === 0;
     el.trashBtn.disabled = state.selected.size === 0;
@@ -878,6 +902,15 @@ function cancelSync() {
   }
   el.progressText.textContent = 'Cancelling…';
   state.syncController.abort();
+  // Do not leave the button stuck in Cancelling… while the fetch unwinds.
+  window.setTimeout(() => {
+    if (!state.syncActive) return;
+    if (el.cancelSyncBtn) {
+      el.cancelSyncBtn.classList.add('hidden');
+      el.cancelSyncBtn.disabled = false;
+      el.cancelSyncBtn.textContent = 'Cancel sync';
+    }
+  }, 150);
 }
 
 el.refreshBtn.onclick = () => {
