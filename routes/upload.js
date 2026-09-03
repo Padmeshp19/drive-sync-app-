@@ -67,7 +67,19 @@ async function walkDrive(drive, fileId, isFolder, relPath, out, visitedFolders =
   if (signal?.aborted) throw new Error('Sync cancelled');
 
   if (!isFolder) {
-    out.push({ id: fileId, relPath, mimeType: null, name: relPath.split('/').pop() });
+    const meta = await getResolvedFileMeta(drive, fileId, signal);
+    if (meta.mimeType === FOLDER_MIME) {
+      return walkDrive(drive, meta.id, true, relPath, out, visitedFolders, signal);
+    }
+    out.push({
+      id: meta.id,
+      relPath,
+      mimeType: meta.mimeType,
+      name: relPath.split('/').pop(),
+      size: meta.size == null ? null : Number(meta.size),
+      fileExtension: meta.fileExtension || '',
+      shortcutDetails: null,
+    });
     return;
   }
 
@@ -84,32 +96,74 @@ async function walkDrive(drive, fileId, isFolder, relPath, out, visitedFolders =
       corpora: 'user',
       includeItemsFromAllDrives: true,
       supportsAllDrives: true,
-      fields: 'nextPageToken, files(id, name, mimeType, size, shortcutDetails(targetId,targetMimeType))',
+      fields: 'nextPageToken, files(id,name,mimeType,size,fileExtension,shortcutDetails(targetId,targetMimeType),capabilities(canDownload))',
       pageSize: 1000,
       pageToken,
       orderBy: 'folder,name',
     }), 5, 500, signal);
 
     for (const child of res.data.files || []) {
-      const childIsFolder = child.mimeType === 'application/vnd.google-apps.folder';
-      const before = out.length;
-      await walkDrive(
-        drive,
-        child.id,
-        childIsFolder,
-        `${relPath}/${child.name}`,
-        out,
-        visitedFolders,
-        signal
-      );
+      if (signal?.aborted) throw new Error('Sync cancelled');
 
-      if (!childIsFolder) {
-        for (let i = before; i < out.length; i += 1) {
-          out[i].mimeType = child.mimeType;
-          out[i].name = child.name;
-          out[i].size = child.size == null ? null : Number(child.size);
-          out[i].shortcutDetails = child.shortcutDetails || null;
+      const isShortcut = child.mimeType === SHORTCUT_MIME;
+      const targetMimeType = child.shortcutDetails?.targetMimeType || '';
+      const shortcutTargetId = child.shortcutDetails?.targetId || '';
+
+      // A shortcut to a folder must be traversed through the TARGET folder ID.
+      // Walking the shortcut ID itself returns no children and eventually causes
+      // the shortcut to be treated like a non-downloadable binary file.
+      if (isShortcut && shortcutTargetId) {
+        const targetMeta = await getResolvedFileMeta(drive, shortcutTargetId, signal);
+
+        if (targetMeta.mimeType === FOLDER_MIME || targetMimeType === FOLDER_MIME) {
+          await walkDrive(
+            drive,
+            targetMeta.id,
+            true,
+            `${relPath}/${child.name}`,
+            out,
+            visitedFolders,
+            signal
+          );
+          continue;
         }
+
+        // Shortcut to a real file: store the TARGET file ID so a direct reference
+        // and a shortcut to the same target are deduplicated later.
+        out.push({
+          id: targetMeta.id,
+          relPath: `${relPath}/${child.name}`,
+          mimeType: targetMeta.mimeType,
+          name: child.name,
+          size: targetMeta.size == null ? null : Number(targetMeta.size),
+          fileExtension: targetMeta.fileExtension || '',
+          shortcutDetails: child.shortcutDetails,
+        });
+        continue;
+      }
+
+      const childIsFolder = child.mimeType === FOLDER_MIME;
+
+      if (childIsFolder) {
+        await walkDrive(
+          drive,
+          child.id,
+          true,
+          `${relPath}/${child.name}`,
+          out,
+          visitedFolders,
+          signal
+        );
+      } else {
+        out.push({
+          id: child.id,
+          relPath: `${relPath}/${child.name}`,
+          mimeType: child.mimeType,
+          name: child.name,
+          size: child.size == null ? null : Number(child.size),
+          fileExtension: child.fileExtension || '',
+          shortcutDetails: child.shortcutDetails || null,
+        });
       }
     }
 
@@ -249,7 +303,7 @@ async function getDriveFileStream(drive, file, signal) {
         exportExtension: '',
         exported: false,
         unsupported: true,
-        unsupportedReason: 'Google Drive reported this item as not downloadable',
+        unsupportedReason: 'Google Drive reported this item as not downloadable; skipped and continuing',
       };
     }
     throw err;
@@ -280,6 +334,7 @@ async function oneDriveItemExists(accessToken, oneDrivePath, signal) {
         headers: { Authorization: `Bearer ${accessToken}` },
         params: { '$select': 'id,name,file,folder,size,lastModifiedDateTime' },
         signal,
+        timeout: 20000,
       }
     ), 3, 400, signal);
     return response.status === 200 && Boolean(response.data?.id);
@@ -296,7 +351,7 @@ async function uploadToOneDrive(accessToken, oneDrivePath, stream, sizeBytes, si
     const sessionRes = await withBackoff(() => axios.post(
       `https://graph.microsoft.com/v1.0/me/drive/root:/${encodedPath}:/createUploadSession`,
       { item: { '@microsoft.graph.conflictBehavior': 'replace' } },
-      { headers: { Authorization: `Bearer ${accessToken}` }, signal }
+      { headers: { Authorization: `Bearer ${accessToken}` }, signal, timeout: 30000 }
     ), 5, 500, signal);
 
     const uploadUrl = sessionRes.data.uploadUrl;
@@ -329,6 +384,7 @@ async function uploadToOneDrive(accessToken, oneDrivePath, stream, sizeBytes, si
           'Content-Range': `bytes ${offset}-${offset + accumulator.length - 1}/${sizeBytes}`,
         },
         signal,
+        timeout: 120000,
       }), 5, 500, signal);
       offset += accumulator.length;
     }
@@ -414,10 +470,12 @@ router.post('/sync', requireAuth, async (req, res) => {
       if (syncController.signal.aborted) throw new Error('Sync cancelled');
 
       try {
+        send('status', { done, total: flatFiles.length, current: file.relPath, phase: 'checking' });
         const originalMeta = await getResolvedFileMeta(drive, file.id, syncController.signal);
         const displayName = file.name || originalMeta.name;
         const oneDrivePathBase = `${dest}/${file.relPath}`;
 
+        send('status', { done, total: flatFiles.length, current: file.relPath, phase: 'downloading' });
         const transfer = await getDriveFileStream(drive, {
           ...originalMeta,
           id: originalMeta.id,
@@ -471,6 +529,7 @@ router.post('/sync', requireAuth, async (req, res) => {
           size = buffered.size;
         }
 
+        send('status', { done, total: flatFiles.length, current: file.relPath, phase: 'uploading' });
         await uploadToOneDrive(accessToken, oneDrivePath, stream, size, syncController.signal);
         done += 1;
         send('progress', { done, total: flatFiles.length, current: file.relPath, skipped: false });
