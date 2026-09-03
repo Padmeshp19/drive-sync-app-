@@ -615,13 +615,19 @@ async function updateSelectionSize() {
     el.selectionSize.textContent = formatBytes(Number(data.totalBytes) || 0);
     el.sizeTrackFill.style.width = data.fileCount > 0 ? '100%' : '0%';
 
-    if (data.unknownSizeCount > 0) {
-      el.selectionSummary.textContent =
-        `${items.length} item${items.length === 1 ? '' : 's'} · ${data.fileCount} file${data.fileCount === 1 ? '' : 's'} · ${data.unknownSizeCount} without size`;
-    } else {
-      el.selectionSummary.textContent =
-        `${items.length} item${items.length === 1 ? '' : 's'} · ${data.fileCount} file${data.fileCount === 1 ? '' : 's'}`;
+    const summaryParts = [
+      `${items.length} item${items.length === 1 ? '' : 's'}`,
+      `${data.fileCount} file${data.fileCount === 1 ? '' : 's'}`,
+    ];
+
+    if (Number(data.exportedCount) > 0) {
+      summaryParts.push(`${data.exportedCount} Google file${data.exportedCount === 1 ? '' : 's'} exported`);
     }
+    if (Number(data.unknownSizeCount) > 0) {
+      summaryParts.push(`${data.unknownSizeCount} without transferable size`);
+    }
+
+    el.selectionSummary.textContent = summaryParts.join(' · ');
 
     setSyncButtonText();
   } catch (err) {
@@ -785,11 +791,20 @@ async function startSync() {
             : 100;
           el.progressFill.style.width = `${pct}%`;
           el.progressText.textContent = `${data.done} / ${data.total}`;
-          addLog(`✓ ${data.current}`, 'ok');
+          if (data.skipped) {
+            addLog(`⚠ Skipped: ${data.current} — ${data.reason}`, 'err');
+          } else {
+            addLog(`✓ ${data.current}`, 'ok');
+          }
         } else if (eventType === 'complete') {
           el.progressFill.style.width = '100%';
-          el.progressText.textContent = `Done — ${data.done} files synced`;
-          addLog('Sync complete.', 'ok');
+          if (data.skipped) {
+            el.progressText.textContent = `Done — ${data.done - data.skipped} synced, ${data.skipped} skipped`;
+            addLog(`Sync complete. ${data.skipped} item(s) could not be transferred.`, 'err');
+          } else {
+            el.progressText.textContent = `Done — ${data.done} files synced`;
+            addLog('Sync complete.', 'ok');
+          }
         } else if (eventType === 'error') {
           addLog(`Error: ${data.message}`, 'err');
           el.progressText.textContent = 'Sync failed — see log';

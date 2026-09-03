@@ -110,6 +110,10 @@ function getExportInfo(mimeType) {
   return GOOGLE_EXPORTS[mimeType] || null;
 }
 
+function isGoogleWorkspaceFile(mimeType) {
+  return typeof mimeType === 'string' && mimeType.startsWith('application/vnd.google-apps.');
+}
+
 async function getDriveFileStream(drive, file) {
   const exportInfo = getExportInfo(file.mimeType);
 
@@ -124,6 +128,20 @@ async function getDriveFileStream(drive, file) {
       stream: response.data,
       size: null,
       exportExtension: exportInfo.extension,
+      exported: true,
+    };
+  }
+
+  // Google Workspace files that are not in GOOGLE_EXPORTS cannot be downloaded
+  // with alt=media. Returning a clear skip signal prevents one such file from
+  // aborting an otherwise valid Drive sync.
+  if (isGoogleWorkspaceFile(file.mimeType)) {
+    return {
+      stream: null,
+      size: null,
+      exportExtension: '',
+      exported: false,
+      unsupported: true,
     };
   }
 
@@ -138,6 +156,8 @@ async function getDriveFileStream(drive, file) {
     stream: response.data,
     size: file.size == null ? null : Number(file.size),
     exportExtension: '',
+    exported: false,
+    unsupported: false,
   };
 }
 
@@ -255,36 +275,73 @@ router.post('/sync', requireAuth, async (req, res) => {
     send('start', { total: flatFiles.length });
 
     let done = 0;
+    let skipped = 0;
     for (const file of flatFiles) {
-      const accessToken = await ensureMsToken(req);
-      const meta = await withBackoff(() =>
-        drive.files.get({ fileId: file.id, fields: 'name, size, mimeType' })
-      );
-      const oneDrivePathBase = `${dest}/${file.relPath}`;
-      const transfer = await getDriveFileStream(drive, {
-        id: file.id,
-        mimeType: meta.data.mimeType,
-        size: meta.data.size == null ? null : Number(meta.data.size),
-      });
+      try {
+        const meta = await withBackoff(() =>
+          drive.files.get({
+            fileId: file.id,
+            fields: 'name, size, mimeType',
+            supportsAllDrives: true,
+          })
+        );
 
-      let oneDrivePath = oneDrivePathBase;
-      let stream = transfer.stream;
-      let size = transfer.size;
+        const oneDrivePathBase = `${dest}/${file.relPath}`;
+        const transfer = await getDriveFileStream(drive, {
+          id: file.id,
+          mimeType: meta.data.mimeType,
+          size: meta.data.size == null ? null : Number(meta.data.size),
+        });
 
-      if (transfer.exportExtension) {
-        const buffered = await bufferStream(stream);
-        stream = require('stream').Readable.from(buffered.buffer);
-        size = buffered.size;
-        if (!oneDrivePath.toLowerCase().endsWith(transfer.exportExtension)) {
-          oneDrivePath += transfer.exportExtension;
+        if (transfer.unsupported) {
+          done += 1;
+          skipped += 1;
+          send('progress', {
+            done,
+            total: flatFiles.length,
+            current: file.relPath,
+            skipped: true,
+            reason: 'Google Workspace file has no supported Drive export format',
+          });
+          continue;
         }
-      }
 
-      await uploadToOneDrive(accessToken, oneDrivePath, stream, size);
-      done += 1;
-      send('progress', { done, total: flatFiles.length, current: file.relPath });
+        const accessToken = await ensureMsToken(req);
+        let oneDrivePath = oneDrivePathBase;
+        let stream = transfer.stream;
+        let size = transfer.size;
+
+        // Exports are streamed without a known Content-Length. Buffer the export
+        // once so OneDrive gets the exact byte count and large exports use an
+        // upload session instead of Graph's small-file endpoint.
+        if (transfer.exportExtension) {
+          const buffered = await bufferStream(stream);
+          stream = require('stream').Readable.from(buffered.buffer);
+          size = buffered.size;
+          if (!oneDrivePath.toLowerCase().endsWith(transfer.exportExtension)) {
+            oneDrivePath += transfer.exportExtension;
+          }
+        }
+
+        await uploadToOneDrive(accessToken, oneDrivePath, stream, size);
+        done += 1;
+        send('progress', { done, total: flatFiles.length, current: file.relPath });
+      } catch (fileErr) {
+        // A single bad/unsupported Drive item should not stop the rest of the
+        // selection. Surface it as a skipped item and continue syncing.
+        done += 1;
+        skipped += 1;
+        console.warn(`Skipping ${file.relPath}:`, fileErr.message);
+        send('progress', {
+          done,
+          total: flatFiles.length,
+          current: file.relPath,
+          skipped: true,
+          reason: fileErr.message,
+        });
+      }
     }
-    send('complete', { done, total: flatFiles.length });
+    send('complete', { done, total: flatFiles.length, skipped });
   } catch (err) {
     console.error('Sync error:', err.message);
     send('error', { message: err.message });
