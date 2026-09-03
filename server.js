@@ -65,7 +65,9 @@ app.get('/auth/microsoft/callback', async (req, res) => {
 app.use('/drive', driveRoutes);
 app.use('/upload', uploadRoutes);
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Drive → OneDrive sync app running at http://localhost:${PORT}`);
+// --- Start server ---
+const PORT = process.env.PORT || 10000;
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Drive → OneDrive sync app running on 0.0.0.0:${PORT}`);
 });
