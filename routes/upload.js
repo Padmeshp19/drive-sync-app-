@@ -3,8 +3,26 @@ const axios = require('axios');
 const { getDriveClient } = require('../auth/google');
 const { refreshTokens } = require('../auth/microsoft');
 const { Readable } = require('stream');
+const { createLimiter } = require('../utils/limiter');
 
 const router = express.Router();
+
+// How many Drive API calls run at once while enumerating a folder tree
+// before the sync even starts. Previously every child (and every recursive
+// subfolder) was awaited one at a time, so a selection with many nested
+// folders could sit silently "calculating" for a long time with zero
+// progress sent to the client.
+const WALK_CONCURRENCY = 8;
+
+// SSE connections that go quiet for too long get killed by browsers and by
+// hosting-platform reverse proxies (Render closes idle connections after a
+// stretch with no bytes sent). The old code sent nothing at all during the
+// walk phase, so a large selection could trip that idle timeout — the
+// client would see the connection drop and the server would report
+// "Sync cancelled by user" even though nobody clicked anything. A periodic
+// SSE comment line keeps bytes flowing without meaning anything to the
+// client's event parser.
+const HEARTBEAT_INTERVAL_MS = 15_000;
 
 function requireAuth(req, res, next) {
   if (!req.session.googleTokens) return res.status(401).json({ error: 'Not authenticated with Google' });
@@ -97,14 +115,18 @@ async function ensureMsToken(req) {
   return fresh.access_token;
 }
 
-async function walkDrive(drive, fileId, isFolder, relPath, out, visitedFolders = new Set(), signal = null) {
+async function walkDrive(drive, fileId, isFolder, relPath, out, visitedFolders = new Set(), signal = null, limit = null) {
   if (signal?.aborted) throw new Error('Sync cancelled');
+
+  // Share one limiter across an entire top-level walk so recursive calls
+  // stay bounded together rather than each spawning their own pool.
+  const runLimited = limit || createLimiter(WALK_CONCURRENCY);
 
   if (!isFolder) {
     const meta = await getResolvedFileMeta(drive, fileId, signal);
     if (!meta) return;
     if (meta.mimeType === FOLDER_MIME) {
-      return walkDrive(drive, meta.id, true, relPath, out, visitedFolders, signal);
+      return walkDrive(drive, meta.id, true, relPath, out, visitedFolders, signal, runLimited);
     }
     out.push({
       id: meta.id,
@@ -137,73 +159,82 @@ async function walkDrive(drive, fileId, isFolder, relPath, out, visitedFolders =
       orderBy: 'folder,name',
     }), 5, 500, signal);
 
-    for (const child of res.data.files || []) {
-      if (signal?.aborted) throw new Error('Sync cancelled');
+    // Process this page's children concurrently (bounded by `runLimited`)
+    // instead of awaiting each child — including each recursive subfolder
+    // walk — one at a time before starting the next.
+    await Promise.all(
+      (res.data.files || []).map((child) =>
+        runLimited(async () => {
+          if (signal?.aborted) throw new Error('Sync cancelled');
 
-      const isShortcut = child.mimeType === SHORTCUT_MIME;
-      const targetMimeType = child.shortcutDetails?.targetMimeType || '';
-      const shortcutTargetId = child.shortcutDetails?.targetId || '';
+          const isShortcut = child.mimeType === SHORTCUT_MIME;
+          const targetMimeType = child.shortcutDetails?.targetMimeType || '';
+          const shortcutTargetId = child.shortcutDetails?.targetId || '';
 
-      // A shortcut to a folder must be traversed through the TARGET folder ID.
-      // Walking the shortcut ID itself returns no children and eventually causes
-      // the shortcut to be treated like a non-downloadable binary file.
-      if (isShortcut && shortcutTargetId) {
-        const targetMeta = await getResolvedFileMeta(drive, shortcutTargetId, signal);
-        if (!targetMeta) {
-          continue;
-        }
+          // A shortcut to a folder must be traversed through the TARGET folder ID.
+          // Walking the shortcut ID itself returns no children and eventually causes
+          // the shortcut to be treated like a non-downloadable binary file.
+          if (isShortcut && shortcutTargetId) {
+            const targetMeta = await getResolvedFileMeta(drive, shortcutTargetId, signal);
+            if (!targetMeta) {
+              return;
+            }
 
-        if (targetMeta.mimeType === FOLDER_MIME || targetMimeType === FOLDER_MIME) {
-          await walkDrive(
-            drive,
-            targetMeta.id,
-            true,
-            `${relPath}/${child.name}`,
-            out,
-            visitedFolders,
-            signal
-          );
-          continue;
-        }
+            if (targetMeta.mimeType === FOLDER_MIME || targetMimeType === FOLDER_MIME) {
+              await walkDrive(
+                drive,
+                targetMeta.id,
+                true,
+                `${relPath}/${child.name}`,
+                out,
+                visitedFolders,
+                signal,
+                runLimited
+              );
+              return;
+            }
 
-        // Shortcut to a real file: store the TARGET file ID so a direct reference
-        // and a shortcut to the same target are deduplicated later.
-        out.push({
-          id: targetMeta.id,
-          relPath: `${relPath}/${child.name}`,
-          mimeType: targetMeta.mimeType,
-          name: child.name,
-          size: targetMeta.size == null ? null : Number(targetMeta.size),
-          fileExtension: targetMeta.fileExtension || '',
-          shortcutDetails: child.shortcutDetails,
-        });
-        continue;
-      }
+            // Shortcut to a real file: store the TARGET file ID so a direct reference
+            // and a shortcut to the same target are deduplicated later.
+            out.push({
+              id: targetMeta.id,
+              relPath: `${relPath}/${child.name}`,
+              mimeType: targetMeta.mimeType,
+              name: child.name,
+              size: targetMeta.size == null ? null : Number(targetMeta.size),
+              fileExtension: targetMeta.fileExtension || '',
+              shortcutDetails: child.shortcutDetails,
+            });
+            return;
+          }
 
-      const childIsFolder = child.mimeType === FOLDER_MIME;
+          const childIsFolder = child.mimeType === FOLDER_MIME;
 
-      if (childIsFolder) {
-        await walkDrive(
-          drive,
-          child.id,
-          true,
-          `${relPath}/${child.name}`,
-          out,
-          visitedFolders,
-          signal
-        );
-      } else {
-        out.push({
-          id: child.id,
-          relPath: `${relPath}/${child.name}`,
-          mimeType: child.mimeType,
-          name: child.name,
-          size: child.size == null ? null : Number(child.size),
-          fileExtension: child.fileExtension || '',
-          shortcutDetails: child.shortcutDetails || null,
-        });
-      }
-    }
+          if (childIsFolder) {
+            await walkDrive(
+              drive,
+              child.id,
+              true,
+              `${relPath}/${child.name}`,
+              out,
+              visitedFolders,
+              signal,
+              runLimited
+            );
+          } else {
+            out.push({
+              id: child.id,
+              relPath: `${relPath}/${child.name}`,
+              mimeType: child.mimeType,
+              name: child.name,
+              size: child.size == null ? null : Number(child.size),
+              fileExtension: child.fileExtension || '',
+              shortcutDetails: child.shortcutDetails || null,
+            });
+          }
+        })
+      )
+    );
 
     pageToken = res.data.nextPageToken;
   } while (pageToken);
@@ -406,7 +437,12 @@ async function uploadToOneDrive(accessToken, oneDrivePath, stream, sizeBytes, si
     ), 5, 500, signal);
 
     const uploadUrl = sessionRes.data.uploadUrl;
-    const chunkSize = 5 * 1024 * 1024;
+    // Microsoft Graph recommends 5-10 MiB chunks for resumable uploads
+    // (fragment size must be a multiple of 320 KiB; 10 MiB qualifies).
+    // Doubling from 5 MiB halves the number of PUT round trips for large
+    // files, which is most of the win here since each round trip pays a
+    // full network RTT plus Graph-side processing on top of transfer time.
+    const chunkSize = 10 * 1024 * 1024;
     let offset = 0;
     let accumulator = Buffer.alloc(0);
 
@@ -493,6 +529,17 @@ router.post('/sync', requireAuth, async (req, res) => {
     }
   });
 
+  // Keep the SSE connection visibly alive during phases (like the initial
+  // folder walk) that can otherwise go a long time without sending an
+  // actual event. Without this, a slow walk on a big selection can look
+  // to the browser/proxy like a dead connection and get closed — which
+  // then surfaces to the user as a false "Sync cancelled".
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded && !res.destroyed) {
+      res.write(': heartbeat\n\n');
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+
   const { items, destFolder } = req.body;
   const drive = getDriveClient(req.session.googleTokens);
   const dest = destFolder || 'DriveSync';
@@ -500,12 +547,23 @@ router.post('/sync', requireAuth, async (req, res) => {
   try {
     const flatFiles = [];
     const seenFiles = new Set();
+    const walkLimit = createLimiter(WALK_CONCURRENCY);
 
-    for (const item of items || []) {
-      if (syncController.signal.aborted) throw new Error('Sync cancelled');
-      const collected = [];
-      await walkDrive(drive, item.id, item.isFolder, item.name, collected, new Set(), syncController.signal);
+    // Walk every top-level selected item concurrently (each keeps its own
+    // visited-folders set to avoid cross-item interference) instead of
+    // fully enumerating one item before starting the next.
+    const collectedPerItem = await Promise.all(
+      (items || []).map((item) =>
+        walkLimit(async () => {
+          if (syncController.signal.aborted) throw new Error('Sync cancelled');
+          const collected = [];
+          await walkDrive(drive, item.id, item.isFolder, item.name, collected, new Set(), syncController.signal, walkLimit);
+          return collected;
+        })
+      )
+    );
 
+    for (const collected of collectedPerItem) {
       for (const file of collected) {
         if (seenFiles.has(file.id)) continue;
         seenFiles.add(file.id);
@@ -519,7 +577,7 @@ router.post('/sync', requireAuth, async (req, res) => {
     let skipped = 0;
     let existing = 0;
 
-    const CONCURRENCY = 3; // a few files in flight at once; high enough to hide
+    const CONCURRENCY = 5; // a few files in flight at once; high enough to hide
                             // per-request latency, low enough not to trip Graph/Drive rate limits
     let nextIndex = 0;
 
@@ -638,6 +696,7 @@ router.post('/sync', requireAuth, async (req, res) => {
       send('error', { message: err.message });
     }
   } finally {
+    clearInterval(heartbeat);
     res.end();
   }
 });

@@ -1,7 +1,15 @@
 const express = require('express');
 const { getDriveClient } = require('../auth/google');
+const { createLimiter } = require('../utils/limiter');
 
 const router = express.Router();
+
+// How many Drive API calls we let run at once while walking a folder tree
+// to total up a selection's size. This used to be strictly sequential
+// (one folder awaited fully before the next started), which is why
+// "Calculating..." could sit there for a long time on a selection with
+// many nested folders — each subfolder's round trip blocked the next one.
+const SIZE_CALC_CONCURRENCY = 8;
 
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
 
@@ -98,7 +106,7 @@ router.get('/list', requireGoogleAuth, async (req, res) => {
   }
 });
 
-async function collectFolderStats(drive, folderId, stats, visited) {
+async function collectFolderStats(drive, folderId, stats, visited, limit) {
   if (visited.has(folderId)) return;
   visited.add(folderId);
 
@@ -108,9 +116,11 @@ async function collectFolderStats(drive, folderId, stats, visited) {
     'id, name, mimeType, size'
   );
 
+  const subfolders = [];
+
   for (const child of children) {
     if (child.mimeType === FOLDER_MIME) {
-      await collectFolderStats(drive, child.id, stats, visited);
+      subfolders.push(child);
       continue;
     }
 
@@ -121,6 +131,14 @@ async function collectFolderStats(drive, folderId, stats, visited) {
       size: child.size == null ? null : Number(child.size),
     });
   }
+
+  // Recurse into subfolders concurrently (bounded by `limit`) instead of
+  // awaiting each one before starting the next.
+  await Promise.all(
+    subfolders.map((child) =>
+      limit(() => collectFolderStats(drive, child.id, stats, visited, limit))
+    )
+  );
 }
 
 router.post('/trash', requireGoogleAuth, async (req, res) => {
@@ -247,32 +265,41 @@ router.post('/selection-size', requireGoogleAuth, async (req, res) => {
   const drive = getDriveClient(req.session.googleTokens);
   const stats = { files: new Map() };
   const visitedFolders = new Set();
+  const limit = createLimiter(SIZE_CALC_CONCURRENCY);
 
   try {
-    for (const item of items) {
-      if (!item || typeof item.id !== 'string' || !item.id) continue;
+    // Kick off every top-level item's stat collection concurrently (bounded
+    // by the same limiter that governs the recursive folder walk below),
+    // rather than fully resolving one selected item before starting the next.
+    await Promise.all(
+      items
+        .filter((item) => item && typeof item.id === 'string' && item.id)
+        .map((item) =>
+          limit(async () => {
+            if (item.isFolder) {
+              await collectFolderStats(drive, item.id, stats, visitedFolders, limit);
+              return;
+            }
 
-      if (item.isFolder) {
-        await collectFolderStats(drive, item.id, stats, visitedFolders);
-      } else {
-        const result = await withBackoff(() =>
-          drive.files.get({
-            fileId: item.id,
-            fields: 'id, name, mimeType, size',
-            supportsAllDrives: true,
+            const result = await withBackoff(() =>
+              drive.files.get({
+                fileId: item.id,
+                fields: 'id, name, mimeType, size',
+                supportsAllDrives: true,
+              })
+            );
+
+            if (result.data.mimeType === FOLDER_MIME) {
+              await collectFolderStats(drive, item.id, stats, visitedFolders, limit);
+            } else {
+              stats.files.set(item.id, {
+                name: result.data.name,
+                size: result.data.size == null ? null : Number(result.data.size),
+              });
+            }
           })
-        );
-
-        if (result.data.mimeType === FOLDER_MIME) {
-          await collectFolderStats(drive, item.id, stats, visitedFolders);
-        } else {
-          stats.files.set(item.id, {
-            name: result.data.name,
-            size: result.data.size == null ? null : Number(result.data.size),
-          });
-        }
-      }
-    }
+        )
+    );
 
     let totalBytes = 0;
     let unknownSizeCount = 0;
