@@ -21,6 +21,40 @@ function isAbortLike(err) {
   );
 }
 
+const STALL_TIMEOUT_MS = 45_000; // no bytes moved for 45s = treat the transfer as dead
+const AXIOS_TIMEOUT_MS = 60_000;
+
+// Wraps a readable stream so it self-destructs if no 'data' event arrives
+// within STALL_TIMEOUT_MS. Without this, a network hiccup mid-download or
+// mid-upload leaves the surrounding `for await (const chunk of stream)`
+// waiting forever — nothing else in the queue ever runs, and there's no
+// error for withBackoff() to retry on, because the stall happens *after*
+// the initial request already succeeded.
+function withStallGuard(stream, signal, label) {
+  let timer;
+  const arm = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      const err = new Error(`Stalled: no data received for ${STALL_TIMEOUT_MS / 1000}s (${label})`);
+      err.code = 'ESTALLED';
+      stream.destroy(err);
+    }, STALL_TIMEOUT_MS);
+  };
+  const clear = () => clearTimeout(timer);
+  arm();
+  stream.on('data', arm);
+  stream.on('end', clear);
+  stream.on('close', clear);
+  stream.on('error', clear);
+  if (signal) {
+    signal.addEventListener('abort', () => {
+      clear();
+      stream.destroy(new Error('Sync cancelled'));
+    }, { once: true });
+  }
+  return stream;
+}
+
 async function withBackoff(fn, retries = 5, delay = 500, signal = null) {
   if (signal?.aborted) throw new Error('Sync cancelled');
 
@@ -267,7 +301,7 @@ async function getDriveFileStream(drive, file, signal) {
     ), 5, 500, signal);
 
     return {
-      stream: response.data,
+      stream: withStallGuard(response.data, signal, `export ${file.name}`),
       size: null,
       exportExtension: exportInfo.extension,
       exported: true,
@@ -305,7 +339,7 @@ async function getDriveFileStream(drive, file, signal) {
     ), 5, 500, signal);
 
     return {
-      stream: response.data,
+      stream: withStallGuard(response.data, signal, `download ${file.name}`),
       size: file.size == null ? null : Number(file.size),
       exportExtension: '',
       exported: false,
@@ -389,6 +423,7 @@ async function uploadToOneDrive(accessToken, oneDrivePath, stream, sizeBytes, si
             'Content-Range': `bytes ${offset}-${offset + slice.length - 1}/${sizeBytes}`,
           },
           signal,
+          timeout: AXIOS_TIMEOUT_MS,
         }), 5, 500, signal);
         offset += slice.length;
       }
@@ -401,7 +436,7 @@ async function uploadToOneDrive(accessToken, oneDrivePath, stream, sizeBytes, si
           'Content-Range': `bytes ${offset}-${offset + accumulator.length - 1}/${sizeBytes}`,
         },
         signal,
-        timeout: 120000,
+        timeout: Math.max(AXIOS_TIMEOUT_MS, 120000),
       }), 5, 500, signal);
       offset += accumulator.length;
     }
@@ -429,6 +464,7 @@ async function uploadToOneDrive(accessToken, oneDrivePath, stream, sizeBytes, si
           'Content-Type': 'application/octet-stream',
         },
         signal,
+        timeout: AXIOS_TIMEOUT_MS,
       }
     ), 5, 500, signal);
   }
@@ -483,8 +519,17 @@ router.post('/sync', requireAuth, async (req, res) => {
     let skipped = 0;
     let existing = 0;
 
-    for (const file of flatFiles) {
-      if (syncController.signal.aborted) throw new Error('Sync cancelled');
+    const CONCURRENCY = 3; // a few files in flight at once; high enough to hide
+                            // per-request latency, low enough not to trip Graph/Drive rate limits
+    let nextIndex = 0;
+
+    async function worker() {
+      while (true) {
+        if (syncController.signal.aborted) throw new Error('Sync cancelled');
+        const myIndex = nextIndex;
+        if (myIndex >= flatFiles.length) return;
+        nextIndex += 1;
+        const file = flatFiles[myIndex];
 
       try {
         send('status', { done, total: flatFiles.length, current: file.relPath, phase: 'checking' });
@@ -576,7 +621,12 @@ router.post('/sync', requireAuth, async (req, res) => {
           reason: fileErr.message,
         });
       }
+      }
     }
+
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, flatFiles.length) }, () => worker())
+    );
 
     send('complete', { done, total: flatFiles.length, skipped, existing });
   } catch (err) {
