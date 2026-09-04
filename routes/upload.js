@@ -1,4 +1,3 @@
-// Google Drive sync: unsupported/non-downloadable Drive items are preserved as .url shortcuts when a Drive link is available.
 const express = require('express');
 const axios = require('axios');
 const { getDriveClient } = require('../auth/google');
@@ -69,6 +68,7 @@ async function walkDrive(drive, fileId, isFolder, relPath, out, visitedFolders =
 
   if (!isFolder) {
     const meta = await getResolvedFileMeta(drive, fileId, signal);
+    if (!meta) return;
     if (meta.mimeType === FOLDER_MIME) {
       return walkDrive(drive, meta.id, true, relPath, out, visitedFolders, signal);
     }
@@ -80,7 +80,6 @@ async function walkDrive(drive, fileId, isFolder, relPath, out, visitedFolders =
       size: meta.size == null ? null : Number(meta.size),
       fileExtension: meta.fileExtension || '',
       shortcutDetails: null,
-      webViewLink: meta.webViewLink || '',
     });
     return;
   }
@@ -116,6 +115,9 @@ async function walkDrive(drive, fileId, isFolder, relPath, out, visitedFolders =
       // the shortcut to be treated like a non-downloadable binary file.
       if (isShortcut && shortcutTargetId) {
         const targetMeta = await getResolvedFileMeta(drive, shortcutTargetId, signal);
+        if (!targetMeta) {
+          continue;
+        }
 
         if (targetMeta.mimeType === FOLDER_MIME || targetMimeType === FOLDER_MIME) {
           await walkDrive(
@@ -140,7 +142,6 @@ async function walkDrive(drive, fileId, isFolder, relPath, out, visitedFolders =
           size: targetMeta.size == null ? null : Number(targetMeta.size),
           fileExtension: targetMeta.fileExtension || '',
           shortcutDetails: child.shortcutDetails,
-          webViewLink: targetMeta.webViewLink || '',
         });
         continue;
       }
@@ -166,7 +167,6 @@ async function walkDrive(drive, fileId, isFolder, relPath, out, visitedFolders =
           size: child.size == null ? null : Number(child.size),
           fileExtension: child.fileExtension || '',
           shortcutDetails: child.shortcutDetails || null,
-          webViewLink: child.webViewLink || '',
         });
       }
     }
@@ -196,7 +196,7 @@ const GOOGLE_EXPORTS = {
 
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
 const SHORTCUT_MIME = 'application/vnd.google-apps.shortcut';
-const FILE_META_FIELDS = 'id,name,mimeType,size,fileExtension,webViewLink,capabilities(canDownload),shortcutDetails(targetId,targetMimeType)';
+const FILE_META_FIELDS = 'id,name,mimeType,size,fileExtension,capabilities(canDownload),shortcutDetails(targetId,targetMimeType)';
 
 function getExportInfo(mimeType) {
   return GOOGLE_EXPORTS[mimeType] || null;
@@ -217,16 +217,29 @@ function isFileNotDownloadableError(err) {
   );
 }
 
+function isFileNotFoundError(err) {
+  const status = err?.response?.status;
+  const code = err?.response?.data?.error?.code;
+  const message = String(err?.response?.data?.error?.message || err?.message || '');
+  return status === 404 || code === 404 || /file not found/i.test(message) || /notFound/i.test(message);
+}
+
 async function getResolvedFileMeta(drive, fileId, signal, seen = new Set()) {
   if (seen.has(fileId)) throw new Error('Shortcut cycle detected');
   if (seen.size > 8) throw new Error('Shortcut chain is too deep');
   seen.add(fileId);
 
-  const response = await withBackoff(() => drive.files.get({
-    fileId,
-    fields: FILE_META_FIELDS,
-    supportsAllDrives: true,
-  }), 5, 500, signal);
+  let response;
+  try {
+    response = await withBackoff(() => drive.files.get({
+      fileId,
+      fields: FILE_META_FIELDS,
+      supportsAllDrives: true,
+    }), 5, 500, signal);
+  } catch (err) {
+    if (isFileNotFoundError(err)) return null;
+    throw err;
+  }
 
   const meta = response.data;
 
@@ -242,19 +255,6 @@ async function getResolvedFileMeta(drive, fileId, signal, seen = new Set()) {
   }
 
   return meta;
-}
-
-function createInternetShortcutBuffer(name, url) {
-  const safeName = String(name || 'Google Drive item').trim() || 'Google Drive item';
-  const safeUrl = String(url || '').trim();
-  const content = `[InternetShortcut]\r\nURL=${safeUrl}\r\n`;
-  return Buffer.from(content, 'utf8');
-}
-
-function withUrlExtension(name) {
-  return String(name || 'Google Drive item').toLowerCase().endsWith('.url')
-    ? String(name || 'Google Drive item')
-    : `${String(name || 'Google Drive item')}.url`;
 }
 
 async function getDriveFileStream(drive, file, signal) {
@@ -274,49 +274,20 @@ async function getDriveFileStream(drive, file, signal) {
     };
   }
 
-  // Some Google Drive items (for example third-party shortcuts or certain
-  // Workspace types) are metadata-only and cannot be downloaded/exported.
-  // Preserve them as clickable .url files instead of losing them. Google
-  // documents that third-party shortcuts cannot be uploaded/downloaded as
-  // content, so a link file is the safe one-shot fallback.
+  // Google Workspace files without a supported export format cannot be sent
+  // through alt=media. Skip them cleanly instead of failing the whole sync.
   if (isGoogleWorkspaceFile(file.mimeType)) {
-    if (file.webViewLink) {
-      return {
-        stream: null,
-        size: 0,
-        exportExtension: '',
-        exported: false,
-        unsupported: false,
-        linkOnly: true,
-        linkUrl: file.webViewLink,
-        linkName: withUrlExtension(file.name),
-      };
-    }
-
     return {
       stream: null,
       size: null,
       exportExtension: '',
       exported: false,
       unsupported: true,
-      unsupportedReason: `Google Drive item type ${file.mimeType} has no downloadable content or Drive link`,
+      unsupportedReason: `Google Workspace file type ${file.mimeType} has no supported Drive export format`,
     };
   }
 
   if (file.capabilities && file.capabilities.canDownload === false) {
-    if (file.webViewLink) {
-      return {
-        stream: null,
-        size: 0,
-        exportExtension: '',
-        exported: false,
-        unsupported: false,
-        linkOnly: true,
-        linkUrl: file.webViewLink,
-        linkName: withUrlExtension(file.name),
-      };
-    }
-
     return {
       stream: null,
       size: null,
@@ -343,26 +314,13 @@ async function getDriveFileStream(drive, file, signal) {
   } catch (err) {
     // A metadata-only Google item should never crash the entire batch.
     if (isFileNotDownloadableError(err)) {
-      if (file.webViewLink) {
-        return {
-          stream: null,
-          size: 0,
-          exportExtension: '',
-          exported: false,
-          unsupported: false,
-          linkOnly: true,
-          linkUrl: file.webViewLink,
-          linkName: withUrlExtension(file.name),
-        };
-      }
-
       return {
         stream: null,
         size: null,
         exportExtension: '',
         exported: false,
         unsupported: true,
-        unsupportedReason: 'Google Drive reported this item as not downloadable and no Drive link was available',
+        unsupportedReason: 'Google Drive reported this item as not downloadable; skipped and continuing',
       };
     }
     throw err;
@@ -531,6 +489,18 @@ router.post('/sync', requireAuth, async (req, res) => {
       try {
         send('status', { done, total: flatFiles.length, current: file.relPath, phase: 'checking' });
         const originalMeta = await getResolvedFileMeta(drive, file.id, syncController.signal);
+        if (!originalMeta) {
+          done += 1;
+          skipped += 1;
+          send('progress', {
+            done,
+            total: flatFiles.length,
+            current: file.relPath,
+            skipped: true,
+            reason: 'File no longer exists in Google Drive — skipped and continuing',
+          });
+          continue;
+        }
         const displayName = file.name || originalMeta.name;
         const oneDrivePathBase = `${dest}/${file.relPath}`;
 
@@ -558,56 +528,6 @@ router.post('/sync', requireAuth, async (req, res) => {
         let oneDrivePath = oneDrivePathBase;
         let stream = transfer.stream;
         let size = transfer.size;
-
-        if (transfer.linkOnly) {
-          oneDrivePath = `${dest}/${file.relPath}.url`;
-          if (await oneDriveItemExists(accessToken, oneDrivePath, syncController.signal)) {
-            done += 1;
-            existing += 1;
-            send('progress', {
-              done,
-              total: flatFiles.length,
-              current: file.relPath,
-              skipped: true,
-              existing: true,
-              reason: 'Drive link already exists in OneDrive — skipped',
-            });
-            continue;
-          }
-
-          const linkBuffer = createInternetShortcutBuffer(
-            file.name,
-            transfer.linkUrl || originalMeta.webViewLink
-          );
-
-          stream = Readable.from(linkBuffer);
-          size = linkBuffer.length;
-
-          send('status', {
-            done,
-            total: flatFiles.length,
-            current: file.relPath,
-            phase: 'saving-link',
-          });
-
-          await uploadToOneDrive(
-            accessToken,
-            oneDrivePath,
-            stream,
-            size,
-            syncController.signal
-          );
-
-          done += 1;
-          send('progress', {
-            done,
-            total: flatFiles.length,
-            current: file.relPath,
-            skipped: false,
-            linked: true,
-          });
-          continue;
-        }
 
         if (transfer.exportExtension) {
           if (!oneDrivePath.toLowerCase().endsWith(transfer.exportExtension)) {
