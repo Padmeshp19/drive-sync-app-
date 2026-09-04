@@ -56,16 +56,50 @@ const el = {
   cancelSyncBtn: document.getElementById('cancelSyncBtn'),
 };
 
+
+/* =========================================================
+   CANCEL BUTTON HELPERS
+   ========================================================= */
+
+function showCancelButton() {
+  if (!el.cancelSyncBtn) return;
+
+  el.cancelSyncBtn.hidden = false;
+  el.cancelSyncBtn.disabled = false;
+  el.cancelSyncBtn.classList.remove('hidden');
+  el.cancelSyncBtn.style.display = 'inline-flex';
+  el.cancelSyncBtn.textContent = 'Cancel sync';
+}
+
+function hideCancelButton() {
+  if (!el.cancelSyncBtn) return;
+
+  el.cancelSyncBtn.disabled = true;
+  el.cancelSyncBtn.hidden = true;
+  el.cancelSyncBtn.classList.add('hidden');
+  el.cancelSyncBtn.style.display = 'none';
+  el.cancelSyncBtn.textContent = 'Cancel sync';
+}
+
+
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 GB';
+
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1000)), units.length - 1);
+  const i = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(1000)),
+    units.length - 1
+  );
+
   const value = bytes / Math.pow(1000, i);
+
   if (i === 0) return `${Math.round(value)} B`;
   if (value >= 100) return `${value.toFixed(0)} ${units[i]}`;
   if (value >= 10) return `${value.toFixed(1)} ${units[i]}`;
+
   return `${value.toFixed(2)} ${units[i]}`;
 }
+
 
 async function checkStatus() {
   try {
@@ -86,156 +120,323 @@ async function checkStatus() {
   }
 }
 
+
 function setPill(pillEl, label, connected) {
-  pillEl.textContent = connected ? `${label}: connected` : `${label}: connect`;
-  pillEl.className = `pill ${connected ? 'connected' : 'disconnected'}`;
+  pillEl.textContent = connected
+    ? `${label}: connected`
+    : `${label}: connect`;
+
+  pillEl.className = `pill ${
+    connected ? 'connected' : 'disconnected'
+  }`;
 
   if (!connected) {
     pillEl.onclick = () => {
-      window.location.href = label === 'Google' ? '/auth/google' : '/auth/microsoft';
+      window.location.href =
+        label === 'Google'
+          ? '/auth/google'
+          : '/auth/microsoft';
     };
   } else {
     pillEl.onclick = null;
   }
 }
 
+
 async function loadFolder(folderId, options = {}) {
   state.searchQuery = '';
   state.searchResults = [];
   state.searchNextPageToken = null;
-  if (el.driveSearch) el.driveSearch.value = '';
-  if (el.clearSearchBtn) el.clearSearchBtn.classList.add('hidden');
-  if (state.searchController) state.searchController.abort();
+
+  if (el.driveSearch) {
+    el.driveSearch.value = '';
+  }
+
+  if (el.clearSearchBtn) {
+    el.clearSearchBtn.classList.add('hidden');
+  }
+
+  if (state.searchController) {
+    state.searchController.abort();
+  }
 
   const requestId = ++state.folderRequest;
   const cached = state.folderCache.get(folderId);
 
-  if (state.folderController) state.folderController.abort();
+  if (state.folderController) {
+    state.folderController.abort();
+  }
 
   if (!options.force && cached) {
-    renderTree(cached.files || [], cached.nextPageToken, folderId);
+    renderTree(
+      cached.files || [],
+      cached.nextPageToken,
+      folderId
+    );
     return;
   }
 
   state.folderController = new AbortController();
+
   el.tree.innerHTML =
     '<li class="tree-item loading-row"><span class="loading-dot"></span><span class="name" style="color:var(--text-dim)">Loading Drive…</span></li>';
 
   try {
     const response = await fetch(
       `/drive/list?parentId=${encodeURIComponent(folderId)}`,
-      { signal: state.folderController.signal }
+      {
+        signal: state.folderController.signal
+      }
     );
+
     const data = await response.json();
 
     if (requestId !== state.folderRequest) return;
+
     if (!response.ok) {
-      throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+      throw new Error(
+        data.detail ||
+        data.error ||
+        `HTTP ${response.status}`
+      );
     }
 
     state.folderCache.set(folderId, data);
-    renderTree(data.files || [], data.nextPageToken, folderId);
+
+    renderTree(
+      data.files || [],
+      data.nextPageToken,
+      folderId
+    );
   } catch (err) {
-    if (err.name === 'AbortError' || requestId !== state.folderRequest) return;
-    console.error('Drive folder load error:', err);
+    if (
+      err.name === 'AbortError' ||
+      requestId !== state.folderRequest
+    ) {
+      return;
+    }
+
+    console.error(
+      'Drive folder load error:',
+      err
+    );
+
     el.tree.innerHTML = `
       <li class="tree-item">
-        <span class="name" style="color:#fb7185">Failed to load Drive: ${escapeHtml(err.message)}</span>
+        <span class="name" style="color:#fb7185">
+          Failed to load Drive: ${escapeHtml(err.message)}
+        </span>
       </li>
     `;
   }
 }
 
+
 function currentVisibleFiles() {
-  if (state.searchQuery) return state.searchResults;
-  const cached = state.folderCache.get(folderIdForCurrentPath());
+  if (state.searchQuery) {
+    return state.searchResults;
+  }
+
+  const cached = state.folderCache.get(
+    folderIdForCurrentPath()
+  );
+
   return cached?.files || [];
 }
+
 
 function updateSelectAllButton() {
   if (!el.selectAllBtn) return;
 
   const files = currentVisibleFiles();
-  const selectedCount = files.filter((file) => state.selected.has(file.id)).length;
-  const allSelected = files.length > 0 && selectedCount === files.length;
-  const someSelected = selectedCount > 0 && !allSelected;
 
-  el.selectAllBtn.textContent = allSelected ? 'Clear all' : 'Select all';
-  el.selectAllBtn.classList.toggle('active', allSelected);
-  el.selectAllBtn.classList.toggle('partial', someSelected);
-  el.selectAllBtn.setAttribute('aria-pressed', String(allSelected));
-  el.selectAllBtn.disabled = files.length === 0;
+  const selectedCount = files.filter(
+    (file) => state.selected.has(file.id)
+  ).length;
+
+  const allSelected =
+    files.length > 0 &&
+    selectedCount === files.length;
+
+  const someSelected =
+    selectedCount > 0 &&
+    !allSelected;
+
+  el.selectAllBtn.textContent =
+    allSelected
+      ? 'Clear all'
+      : 'Select all';
+
+  el.selectAllBtn.classList.toggle(
+    'active',
+    allSelected
+  );
+
+  el.selectAllBtn.classList.toggle(
+    'partial',
+    someSelected
+  );
+
+  el.selectAllBtn.setAttribute(
+    'aria-pressed',
+    String(allSelected)
+  );
+
+  el.selectAllBtn.disabled =
+    files.length === 0;
 }
+
 
 async function fetchAllFolderItems(folderId, signal) {
   const all = [];
   let pageToken = null;
+
   do {
-    const params = new URLSearchParams({ parentId: folderId });
-    if (pageToken) params.set('pageToken', pageToken);
-    const response = await fetch(`/drive/list?${params.toString()}`, { signal });
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+    const params = new URLSearchParams({
+      parentId: folderId
+    });
+
+    if (pageToken) {
+      params.set('pageToken', pageToken);
     }
+
+    const response = await fetch(
+      `/drive/list?${params.toString()}`,
+      { signal }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(
+        data.detail ||
+        data.error ||
+        `HTTP ${response.status}`
+      );
+    }
+
     all.push(...(data.files || []));
     pageToken = data.nextPageToken || null;
   } while (pageToken);
+
   return all;
 }
+
 
 async function fetchAllSearchItems(signal) {
   const all = [];
   let pageToken = null;
+
   do {
-    const params = new URLSearchParams({ q: state.searchQuery });
-    if (pageToken) params.set('pageToken', pageToken);
-    const response = await fetch(`/drive/search?${params.toString()}`, { signal });
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+    const params = new URLSearchParams({
+      q: state.searchQuery
+    });
+
+    if (pageToken) {
+      params.set('pageToken', pageToken);
     }
+
+    const response = await fetch(
+      `/drive/search?${params.toString()}`,
+      { signal }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(
+        data.detail ||
+        data.error ||
+        `HTTP ${response.status}`
+      );
+    }
+
     all.push(...(data.files || []));
     pageToken = data.nextPageToken || null;
   } while (pageToken);
+
   return all;
 }
 
+
 async function selectAllCurrentView() {
-  if (!el.selectAllBtn || state.selectAllBusy) return;
+  if (
+    !el.selectAllBtn ||
+    state.selectAllBusy
+  ) {
+    return;
+  }
 
   const initial = currentVisibleFiles();
-  if (initial.length === 0) return;
 
-  const alreadyFullyLoaded = state.searchQuery
-    ? !state.searchNextPageToken
-    : !(state.folderCache.get(folderIdForCurrentPath())?.nextPageToken);
-  const allKnownSelected = initial.every((file) => state.selected.has(file.id));
+  if (initial.length === 0) {
+    return;
+  }
 
-  if (alreadyFullyLoaded && allKnownSelected) {
-    initial.forEach((file) => state.selected.delete(file.id));
+  const alreadyFullyLoaded =
+    state.searchQuery
+      ? !state.searchNextPageToken
+      : !(
+          state.folderCache.get(
+            folderIdForCurrentPath()
+          )?.nextPageToken
+        );
+
+  const allKnownSelected =
+    initial.every(
+      (file) => state.selected.has(file.id)
+    );
+
+  if (
+    alreadyFullyLoaded &&
+    allKnownSelected
+  ) {
+    initial.forEach((file) => {
+      state.selected.delete(file.id);
+    });
+
     state.selectionStats = null;
+
     renderSelectedList();
     updateVisibleCheckboxes();
     updateSelectionSize();
     updateSelectAllButton();
+
     return;
   }
 
   state.selectAllBusy = true;
   el.selectAllBtn.disabled = true;
   el.selectAllBtn.textContent = 'Selecting…';
-  if (state.selectAllController) state.selectAllController.abort();
-  state.selectAllController = new AbortController();
+
+  if (state.selectAllController) {
+    state.selectAllController.abort();
+  }
+
+  state.selectAllController =
+    new AbortController();
 
   try {
     const all = state.searchQuery
-      ? await fetchAllSearchItems(state.selectAllController.signal)
-      : await fetchAllFolderItems(folderIdForCurrentPath(), state.selectAllController.signal);
+      ? await fetchAllSearchItems(
+          state.selectAllController.signal
+        )
+      : await fetchAllFolderItems(
+          folderIdForCurrentPath(),
+          state.selectAllController.signal
+        );
 
     if (!state.searchQuery) {
-      const folderId = folderIdForCurrentPath();
-      state.folderCache.set(folderId, { files: all, nextPageToken: null });
+      const folderId =
+        folderIdForCurrentPath();
+
+      state.folderCache.set(
+        folderId,
+        {
+          files: all,
+          nextPageToken: null
+        }
+      );
     } else {
       state.searchResults = all;
       state.searchNextPageToken = null;
@@ -246,327 +447,666 @@ async function selectAllCurrentView() {
         id: file.id,
         name: file.name,
         isFolder: file.isFolder,
-        size: file.size,
+        size: file.size
       });
     });
 
-    if (state.searchQuery) renderSearchResults();
-    else renderTree(all, null, folderIdForCurrentPath());
+    if (state.searchQuery) {
+      renderSearchResults();
+    } else {
+      renderTree(
+        all,
+        null,
+        folderIdForCurrentPath()
+      );
+    }
 
     renderSelectedList();
     updateSelectionSize();
     updateSelectAllButton();
+
   } catch (err) {
     if (err.name !== 'AbortError') {
-      console.error('Select all error:', err);
-      el.selectAllBtn.textContent = 'Select all';
+      console.error(
+        'Select all error:',
+        err
+      );
+
+      el.selectAllBtn.textContent =
+        'Select all';
     }
   } finally {
     state.selectAllBusy = false;
     state.selectAllController = null;
+
     updateSelectAllButton();
   }
 }
 
-function renderTree(files, nextPageToken = null, folderId = folderIdForCurrentPath()) {
+
+function renderTree(
+  files,
+  nextPageToken = null,
+  folderId = folderIdForCurrentPath()
+) {
   el.tree.innerHTML = '';
+
   renderBreadcrumb();
 
   if (files.length === 0) {
     el.tree.innerHTML =
       '<li class="tree-item"><span class="name" style="color:var(--text-dim)">This folder is empty.</span></li>';
+
     updateSelectAllButton();
     return;
   }
 
   for (const file of files) {
-    const li = document.createElement('li');
+    const li =
+      document.createElement('li');
+
     li.className = 'tree-item';
 
-    const checkbox = document.createElement('input');
+    const checkbox =
+      document.createElement('input');
+
     checkbox.type = 'checkbox';
-    checkbox.checked = state.selected.has(file.id);
+
+    checkbox.checked =
+      state.selected.has(file.id);
+
     checkbox.setAttribute(
       'aria-label',
       `Select ${file.name} for sync`
     );
+
     checkbox.dataset.fileId = file.id;
 
     checkbox.onchange = () => {
       if (checkbox.checked) {
-        state.selected.set(file.id, {
-          id: file.id,
-          name: file.name,
-          isFolder: file.isFolder,
-          size: file.size,
-        });
+        state.selected.set(
+          file.id,
+          {
+            id: file.id,
+            name: file.name,
+            isFolder: file.isFolder,
+            size: file.size
+          }
+        );
       } else {
-        state.selected.delete(file.id);
+        state.selected.delete(
+          file.id
+        );
       }
+
       renderSelectedList();
       updateSelectionSize();
       updateSelectAllButton();
     };
 
-    const name = document.createElement('span');
-    name.className = `name ${file.isFolder ? 'folder' : 'file'}`;
+    const name =
+      document.createElement('span');
+
+    name.className =
+      `name ${file.isFolder ? 'folder' : 'file'}`;
+
     name.textContent = file.name;
 
     if (file.isFolder) {
       name.onclick = () => {
-        state.path.push({ id: file.id, name: file.name });
+        state.path.push({
+          id: file.id,
+          name: file.name
+        });
+
         loadFolder(file.id);
       };
     }
 
     li.appendChild(checkbox);
     li.appendChild(name);
+
     el.tree.appendChild(li);
   }
 
   if (nextPageToken) {
-    const more = document.createElement('li');
-    more.className = 'tree-item load-more-row';
-    const button = document.createElement('button');
+    const more =
+      document.createElement('li');
+
+    more.className =
+      'tree-item load-more-row';
+
+    const button =
+      document.createElement('button');
+
     button.type = 'button';
     button.className = 'load-more';
-    button.textContent = 'Load more items';
-    button.onclick = () => loadMore(folderId, nextPageToken);
-    more.appendChild(document.createElement('span'));
+    button.textContent =
+      'Load more items';
+
+    button.onclick = () =>
+      loadMore(
+        folderId,
+        nextPageToken
+      );
+
+    more.appendChild(
+      document.createElement('span')
+    );
+
     more.appendChild(button);
+
     el.tree.appendChild(more);
   }
 
   updateSelectAllButton();
 }
 
+
 function folderIdForCurrentPath() {
-  return state.path[state.path.length - 1].id;
+  return state.path[
+    state.path.length - 1
+  ].id;
 }
 
-async function loadMore(folderId, pageToken) {
+
+async function loadMore(
+  folderId,
+  pageToken
+) {
   try {
     const response = await fetch(
-      `/drive/list?parentId=${encodeURIComponent(folderId)}&pageToken=${encodeURIComponent(pageToken)}`
+      `/drive/list?parentId=${encodeURIComponent(
+        folderId
+      )}&pageToken=${encodeURIComponent(
+        pageToken
+      )}`
     );
-    const data = await response.json();
+
+    const data =
+      await response.json();
+
     if (!response.ok) {
-      throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+      throw new Error(
+        data.detail ||
+        data.error ||
+        `HTTP ${response.status}`
+      );
     }
-    const cached = state.folderCache.get(folderId) || { files: [] };
+
+    const cached =
+      state.folderCache.get(
+        folderId
+      ) || {
+        files: []
+      };
+
     const merged = {
-      files: [...(cached.files || []), ...(data.files || [])],
-      nextPageToken: data.nextPageToken || null,
+      files: [
+        ...(cached.files || []),
+        ...(data.files || [])
+      ],
+      nextPageToken:
+        data.nextPageToken || null
     };
-    state.folderCache.set(folderId, merged);
-    renderTree(merged.files, merged.nextPageToken, folderId);
+
+    state.folderCache.set(
+      folderId,
+      merged
+    );
+
+    renderTree(
+      merged.files,
+      merged.nextPageToken,
+      folderId
+    );
+
   } catch (err) {
-    console.error('Load more error:', err);
+    console.error(
+      'Load more error:',
+      err
+    );
   }
 }
 
 
-async function searchDrive(query, options = {}) {
-  const term = String(query || '').trim();
+async function searchDrive(
+  query,
+  options = {}
+) {
+  const term =
+    String(query || '').trim();
 
   if (term.length < 2) {
     clearDriveSearch(false);
     return;
   }
 
-  if (state.searchController) state.searchController.abort();
-  if (state.folderController) state.folderController.abort();
+  if (state.searchController) {
+    state.searchController.abort();
+  }
 
-  const requestId = ++state.searchRequest;
+  if (state.folderController) {
+    state.folderController.abort();
+  }
+
+  const requestId =
+    ++state.searchRequest;
+
   state.searchQuery = term;
-  if (!options.append) state.searchResults = [];
-  if (!options.append) state.searchNextPageToken = null;
-  if (el.clearSearchBtn) el.clearSearchBtn.classList.remove('hidden');
+
+  if (!options.append) {
+    state.searchResults = [];
+  }
+
+  if (!options.append) {
+    state.searchNextPageToken = null;
+  }
+
+  if (el.clearSearchBtn) {
+    el.clearSearchBtn.classList.remove(
+      'hidden'
+    );
+  }
 
   if (!options.append) {
     el.tree.innerHTML =
       '<li class="tree-item loading-row"><span class="loading-dot"></span><span class="name" style="color:var(--text-dim)">Searching Google Drive…</span></li>';
   }
 
-  state.searchController = new AbortController();
+  state.searchController =
+    new AbortController();
 
   try {
-    const params = new URLSearchParams({ q: term });
-    if (options.pageToken) params.set('pageToken', options.pageToken);
+    const params =
+      new URLSearchParams({
+        q: term
+      });
 
-    const response = await fetch(`/drive/search?${params.toString()}`, {
-      signal: state.searchController.signal,
-    });
-    const data = await response.json();
+    if (options.pageToken) {
+      params.set(
+        'pageToken',
+        options.pageToken
+      );
+    }
 
-    if (requestId !== state.searchRequest) return;
+    const response = await fetch(
+      `/drive/search?${params.toString()}`,
+      {
+        signal:
+          state.searchController.signal
+      }
+    );
+
+    const data =
+      await response.json();
+
+    if (
+      requestId !==
+      state.searchRequest
+    ) {
+      return;
+    }
+
     if (!response.ok) {
-      throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+      throw new Error(
+        data.detail ||
+        data.error ||
+        `HTTP ${response.status}`
+      );
     }
 
     if (options.append) {
-      state.searchResults.push(...(data.files || []));
+      state.searchResults.push(
+        ...(data.files || [])
+      );
     } else {
-      state.searchResults = data.files || [];
+      state.searchResults =
+        data.files || [];
     }
-    state.searchNextPageToken = data.nextPageToken || null;
+
+    state.searchNextPageToken =
+      data.nextPageToken || null;
+
     renderSearchResults();
+
   } catch (err) {
-    if (err.name === 'AbortError' || requestId !== state.searchRequest) return;
-    console.error('Drive search error:', err);
+    if (
+      err.name === 'AbortError' ||
+      requestId !== state.searchRequest
+    ) {
+      return;
+    }
+
+    console.error(
+      'Drive search error:',
+      err
+    );
+
     el.tree.innerHTML = `
       <li class="tree-item">
-        <span class="name" style="color:#fb7185">Search failed: ${escapeHtml(err.message)}</span>
+        <span class="name" style="color:#fb7185">
+          Search failed: ${escapeHtml(
+            err.message
+          )}
+        </span>
       </li>
     `;
   }
 }
 
+
 function renderSearchResults() {
   el.tree.innerHTML = '';
   el.breadcrumb.innerHTML = '';
 
-  const label = document.createElement('span');
-  label.className = 'search-results-label';
-  label.textContent = `Search results for “${state.searchQuery}”`;
+  const label =
+    document.createElement('span');
+
+  label.className =
+    'search-results-label';
+
+  label.textContent =
+    `Search results for “${state.searchQuery}”`;
+
   el.breadcrumb.appendChild(label);
 
   if (state.searchResults.length === 0) {
     el.tree.innerHTML =
       '<li class="tree-item"><span class="name" style="color:var(--text-dim)">No matching files or folders found.</span></li>';
+
     updateSelectAllButton();
     return;
   }
 
   for (const file of state.searchResults) {
-    const li = document.createElement('li');
-    li.className = 'tree-item search-result-item';
+    const li =
+      document.createElement('li');
 
-    const checkbox = document.createElement('input');
+    li.className =
+      'tree-item search-result-item';
+
+    const checkbox =
+      document.createElement('input');
+
     checkbox.type = 'checkbox';
-    checkbox.checked = state.selected.has(file.id);
-    checkbox.dataset.fileId = file.id;
-    checkbox.setAttribute('aria-label', `Select ${file.name} for sync`);
+
+    checkbox.checked =
+      state.selected.has(file.id);
+
+    checkbox.dataset.fileId =
+      file.id;
+
+    checkbox.setAttribute(
+      'aria-label',
+      `Select ${file.name} for sync`
+    );
+
     checkbox.onchange = () => {
       if (checkbox.checked) {
-        state.selected.set(file.id, {
-          id: file.id,
-          name: file.name,
-          isFolder: file.isFolder,
-          size: file.size,
-        });
+        state.selected.set(
+          file.id,
+          {
+            id: file.id,
+            name: file.name,
+            isFolder: file.isFolder,
+            size: file.size
+          }
+        );
       } else {
-        state.selected.delete(file.id);
+        state.selected.delete(
+          file.id
+        );
       }
+
       renderSelectedList();
       updateSelectionSize();
       updateSelectAllButton();
     };
 
-    const name = document.createElement('span');
-    name.className = `name ${file.isFolder ? 'folder' : 'file'}`;
-    name.textContent = file.name;
-    name.title = file.name;
+    const name =
+      document.createElement('span');
+
+    name.className =
+      `name ${file.isFolder ? 'folder' : 'file'}`;
+
+    name.textContent =
+      file.name;
+
+    name.title =
+      file.name;
 
     if (file.isFolder) {
       name.onclick = () => {
-        state.path = [{ id: 'root', name: 'My Drive' }, { id: file.id, name: file.name }];
+        state.path = [
+          {
+            id: 'root',
+            name: 'My Drive'
+          },
+          {
+            id: file.id,
+            name: file.name
+          }
+        ];
+
         loadFolder(file.id);
       };
     }
 
-    const meta = document.createElement('span');
-    meta.className = 'search-result-meta';
-    meta.textContent = file.isFolder ? 'FOLDER' : (file.size ? formatBytes(Number(file.size)) : 'FILE');
+    const meta =
+      document.createElement('span');
+
+    meta.className =
+      'search-result-meta';
+
+    meta.textContent =
+      file.isFolder
+        ? 'FOLDER'
+        : (
+            file.size
+              ? formatBytes(
+                  Number(file.size)
+                )
+              : 'FILE'
+          );
 
     li.appendChild(checkbox);
     li.appendChild(name);
     li.appendChild(meta);
+
     el.tree.appendChild(li);
   }
 
   if (state.searchNextPageToken) {
-    const more = document.createElement('li');
-    more.className = 'tree-item load-more-row';
-    const button = document.createElement('button');
+    const more =
+      document.createElement('li');
+
+    more.className =
+      'tree-item load-more-row';
+
+    const button =
+      document.createElement('button');
+
     button.type = 'button';
     button.className = 'load-more';
-    button.textContent = 'Load more results';
-    button.onclick = () => searchDrive(state.searchQuery, {
-      append: true,
-      pageToken: state.searchNextPageToken,
-    });
-    more.appendChild(document.createElement('span'));
+    button.textContent =
+      'Load more results';
+
+    button.onclick = () =>
+      searchDrive(
+        state.searchQuery,
+        {
+          append: true,
+          pageToken:
+            state.searchNextPageToken
+        }
+      );
+
+    more.appendChild(
+      document.createElement('span')
+    );
+
     more.appendChild(button);
+
     el.tree.appendChild(more);
   }
 
   updateSelectAllButton();
 }
 
-function clearDriveSearch(loadCurrentFolder = true) {
-  if (state.searchController) state.searchController.abort();
+
+function clearDriveSearch(
+  loadCurrentFolder = true
+) {
+  if (state.searchController) {
+    state.searchController.abort();
+  }
+
   state.searchRequest += 1;
+
   state.searchQuery = '';
   state.searchResults = [];
   state.searchNextPageToken = null;
-  if (el.driveSearch) el.driveSearch.value = '';
-  if (el.clearSearchBtn) el.clearSearchBtn.classList.add('hidden');
-  if (loadCurrentFolder) loadFolder(folderIdForCurrentPath());
+
+  if (el.driveSearch) {
+    el.driveSearch.value = '';
+  }
+
+  if (el.clearSearchBtn) {
+    el.clearSearchBtn.classList.add(
+      'hidden'
+    );
+  }
+
+  if (loadCurrentFolder) {
+    loadFolder(
+      folderIdForCurrentPath()
+    );
+  }
 }
+
 
 function renderBreadcrumb() {
   el.breadcrumb.innerHTML = '';
 
-  state.path.forEach((part, index) => {
-    if (index > 0) {
-      const slash = document.createElement('span');
-      slash.textContent = ' / ';
-      slash.style.margin = '0 6px';
-      slash.style.color = '#5f5268';
-      el.breadcrumb.appendChild(slash);
+  state.path.forEach(
+    (part, index) => {
+      if (index > 0) {
+        const slash =
+          document.createElement(
+            'span'
+          );
+
+        slash.textContent = ' / ';
+        slash.style.margin =
+          '0 6px';
+
+        slash.style.color =
+          '#5f5268';
+
+        el.breadcrumb.appendChild(
+          slash
+        );
+      }
+
+      const button =
+        document.createElement(
+          'button'
+        );
+
+      button.textContent =
+        part.name;
+
+      button.onclick = () => {
+        state.path =
+          state.path.slice(
+            0,
+            index + 1
+          );
+
+        loadFolder(
+          part.id
+        );
+      };
+
+      el.breadcrumb.appendChild(
+        button
+      );
     }
-
-    const button = document.createElement('button');
-    button.textContent = part.name;
-    button.onclick = () => {
-      state.path = state.path.slice(0, index + 1);
-      loadFolder(part.id);
-    };
-
-    el.breadcrumb.appendChild(button);
-  });
+  );
 }
+
 
 function renderSelectedList() {
   el.selectedList.innerHTML = '';
 
-  const items = Array.from(state.selected.values());
+  const items =
+    Array.from(
+      state.selected.values()
+    );
 
   if (items.length === 0) {
     el.selectedList.innerHTML =
       '<div class="empty-selection">Choose something from Google Drive.</div>';
   } else {
     for (const item of items) {
-      const row = document.createElement('div');
-      row.className = 'sel-item';
+      const row =
+        document.createElement(
+          'div'
+        );
 
-      const label = document.createElement('span');
-      label.className = 'sel-name';
-      label.textContent = item.name;
-      label.title = item.name;
+      row.className =
+        'sel-item';
 
-      const type = document.createElement('span');
-      type.className = 'sel-type';
-      type.textContent = item.isFolder ? 'FOLDER' : 'FILE';
+      const label =
+        document.createElement(
+          'span'
+        );
 
-      const remove = document.createElement('button');
-      remove.className = 'sel-remove';
-      remove.type = 'button';
-      remove.textContent = '×';
-      remove.title = `Remove ${item.name}`;
+      label.className =
+        'sel-name';
+
+      label.textContent =
+        item.name;
+
+      label.title =
+        item.name;
+
+      const type =
+        document.createElement(
+          'span'
+        );
+
+      type.className =
+        'sel-type';
+
+      type.textContent =
+        item.isFolder
+          ? 'FOLDER'
+          : 'FILE';
+
+      const remove =
+        document.createElement(
+          'button'
+        );
+
+      remove.className =
+        'sel-remove';
+
+      remove.type =
+        'button';
+
+      remove.textContent =
+        '×';
+
+      remove.title =
+        `Remove ${item.name}`;
+
       remove.onclick = () => {
-        state.selected.delete(item.id);
+        state.selected.delete(
+          item.id
+        );
+
         renderSelectedList();
         updateVisibleCheckboxes();
         updateSelectionSize();
@@ -576,415 +1116,1091 @@ function renderSelectedList() {
       row.appendChild(label);
       row.appendChild(type);
       row.appendChild(remove);
-      el.selectedList.appendChild(row);
+
+      el.selectedList.appendChild(
+        row
+      );
     }
   }
 
-  const count = items.length;
+  const count =
+    items.length;
+
   el.selectionSummary.textContent =
     count === 0
       ? 'Nothing selected'
-      : `${count} item${count === 1 ? '' : 's'} selected`;
+      : `${count} item${
+          count === 1 ? '' : 's'
+        } selected`;
 
-  el.syncBtn.disabled = count === 0;
-  el.trashBtn.disabled = count === 0;
+  el.syncBtn.disabled =
+    count === 0;
+
+  el.trashBtn.disabled =
+    count === 0;
+
   setSyncButtonText();
 }
 
+
 function updateVisibleCheckboxes() {
-  el.tree.querySelectorAll('input[type="checkbox"]').forEach((checkbox) => {
-    checkbox.checked = state.selected.has(checkbox.dataset.fileId);
-  });
+  el.tree
+    .querySelectorAll(
+      'input[type="checkbox"]'
+    )
+    .forEach(
+      (checkbox) => {
+        checkbox.checked =
+          state.selected.has(
+            checkbox.dataset.fileId
+          );
+      }
+    );
 }
 
+
 async function updateSelectionSize() {
-  const items = Array.from(state.selected.values());
-  const requestId = ++state.sizeRequest;
+  const items =
+    Array.from(
+      state.selected.values()
+    );
+
+  const requestId =
+    ++state.sizeRequest;
 
   if (items.length === 0) {
-    el.selectionSize.textContent = '0 GB';
-    el.sizeTrackFill.style.width = '0%';
+    el.selectionSize.textContent =
+      '0 GB';
+
+    el.sizeTrackFill.style.width =
+      '0%';
+
     setSyncButtonText();
     return;
   }
 
-  el.selectionSize.textContent = 'Calculating…';
-  el.sizeTrackFill.style.width = '35%';
+  el.selectionSize.textContent =
+    'Calculating…';
+
+  el.sizeTrackFill.style.width =
+    '35%';
+
   setSyncButtonText();
 
   try {
-    const response = await fetch('/drive/selection-size', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        items: items.map(({ id, isFolder }) => ({ id, isFolder })),
-      }),
-    });
+    const response =
+      await fetch(
+        '/drive/selection-size',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type':
+              'application/json'
+          },
+          body: JSON.stringify({
+            items:
+              items.map(
+                ({
+                  id,
+                  isFolder
+                }) => ({
+                  id,
+                  isFolder
+                })
+              )
+          })
+        }
+      );
 
-    const data = await response.json();
+    const data =
+      await response.json();
 
-    if (requestId !== state.sizeRequest) return;
+    if (
+      requestId !==
+      state.sizeRequest
+    ) {
+      return;
+    }
 
     if (!response.ok) {
-      throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+      throw new Error(
+        data.detail ||
+        data.error ||
+        `HTTP ${response.status}`
+      );
     }
 
-    state.selectionStats = data;
-    el.selectionSize.textContent = formatBytes(Number(data.totalBytes) || 0);
-    el.sizeTrackFill.style.width = data.fileCount > 0 ? '100%' : '0%';
+    state.selectionStats =
+      data;
+
+    el.selectionSize.textContent =
+      formatBytes(
+        Number(
+          data.totalBytes
+        ) || 0
+      );
+
+    el.sizeTrackFill.style.width =
+      data.fileCount > 0
+        ? '100%'
+        : '0%';
 
     const summaryParts = [
-      `${items.length} item${items.length === 1 ? '' : 's'}`,
-      `${data.fileCount} file${data.fileCount === 1 ? '' : 's'}`,
+      `${items.length} item${
+        items.length === 1 ? '' : 's'
+      }`,
+      `${data.fileCount} file${
+        data.fileCount === 1 ? '' : 's'
+      }`
     ];
 
-    if (Number(data.exportedCount) > 0) {
-      summaryParts.push(`${data.exportedCount} Google file${data.exportedCount === 1 ? '' : 's'} exported`);
-    }
-    if (Number(data.unknownSizeCount) > 0) {
-      summaryParts.push(`${data.unknownSizeCount} without transferable size`);
+    if (
+      Number(
+        data.exportedCount
+      ) > 0
+    ) {
+      summaryParts.push(
+        `${data.exportedCount} Google file${
+          data.exportedCount === 1
+            ? ''
+            : 's'
+        } exported`
+      );
     }
 
-    el.selectionSummary.textContent = summaryParts.join(' · ');
+    if (
+      Number(
+        data.unknownSizeCount
+      ) > 0
+    ) {
+      summaryParts.push(
+        `${data.unknownSizeCount} without transferable size`
+      );
+    }
+
+    el.selectionSummary.textContent =
+      summaryParts.join(
+        ' · '
+      );
 
     setSyncButtonText();
+
   } catch (err) {
-    if (requestId !== state.sizeRequest) return;
-    console.error('Selection size error:', err);
-    state.selectionStats = null;
-    el.selectionSize.textContent = 'Size unavailable';
-    el.sizeTrackFill.style.width = '0%';
+    if (
+      requestId !==
+      state.sizeRequest
+    ) {
+      return;
+    }
+
+    console.error(
+      'Selection size error:',
+      err
+    );
+
+    state.selectionStats =
+      null;
+
+    el.selectionSize.textContent =
+      'Size unavailable';
+
+    el.sizeTrackFill.style.width =
+      '0%';
+
     setSyncButtonText();
   }
 }
 
+
 function setSyncButtonText() {
-  const items = Array.from(state.selected.values());
+  const items =
+    Array.from(
+      state.selected.values()
+    );
 
   if (items.length === 0) {
     el.syncBtn.innerHTML =
       '<span>Select items to sync</span><span class="btn-arrow">→</span>';
+
     return;
   }
 
-  const stats = state.selectionStats;
-  const size = stats && Number.isFinite(Number(stats.totalBytes))
-    ? formatBytes(Number(stats.totalBytes))
-    : '…';
+  const stats =
+    state.selectionStats;
+
+  const size =
+    stats &&
+    Number.isFinite(
+      Number(
+        stats.totalBytes
+      )
+    )
+      ? formatBytes(
+          Number(
+            stats.totalBytes
+          )
+        )
+      : '…';
 
   el.syncBtn.innerHTML =
     `<span>Sync ${size} → OneDrive</span><span class="btn-arrow">→</span>`;
 }
 
+
 function addLog(text, cls) {
-  const li = document.createElement('li');
-  li.textContent = text;
-  if (cls) li.className = cls;
+  const li =
+    document.createElement(
+      'li'
+    );
+
+  li.textContent =
+    text;
+
+  if (cls) {
+    li.className =
+      cls;
+  }
+
   el.log.appendChild(li);
-  el.log.scrollTop = el.log.scrollHeight;
+
+  el.log.scrollTop =
+    el.log.scrollHeight;
 }
 
+
 async function moveSelectedToTrash() {
-  const items = Array.from(state.selected.values());
-  if (items.length === 0) return;
+  const items =
+    Array.from(
+      state.selected.values()
+    );
 
-  const folderCount = items.filter((item) => item.isFolder).length;
-  const fileCount = items.length - folderCount;
+  if (items.length === 0) {
+    return;
+  }
+
+  const folderCount =
+    items.filter(
+      (item) => item.isFolder
+    ).length;
+
+  const fileCount =
+    items.length -
+    folderCount;
+
   const parts = [];
-  if (fileCount) parts.push(`${fileCount} file${fileCount === 1 ? '' : 's'}`);
-  if (folderCount) parts.push(`${folderCount} folder${folderCount === 1 ? '' : 's'}`);
 
-  const confirmed = window.confirm(
-    `Move ${parts.join(' and ')} to Google Drive Trash?\n\n` +
-    `This removes the selected item${items.length === 1 ? '' : 's'} from My Drive. ` +
-    `You can restore them from Google Drive Trash.`
+  if (fileCount) {
+    parts.push(
+      `${fileCount} file${
+        fileCount === 1
+          ? ''
+          : 's'
+      }`
+    );
+  }
+
+  if (folderCount) {
+    parts.push(
+      `${folderCount} folder${
+        folderCount === 1
+          ? ''
+          : 's'
+      }`
+    );
+  }
+
+  const confirmed =
+    window.confirm(
+      `Move ${parts.join(
+        ' and '
+      )} to Google Drive Trash?\n\n` +
+      `This removes the selected item${
+        items.length === 1
+          ? ''
+          : 's'
+      } from My Drive. ` +
+      `You can restore them from Google Drive Trash.`
+    );
+
+  if (!confirmed) {
+    return;
+  }
+
+  el.syncBtn.disabled =
+    true;
+
+  el.trashBtn.disabled =
+    true;
+
+  el.progressWrap.classList.remove(
+    'hidden'
   );
 
-  if (!confirmed) return;
+  el.progressFill.style.width =
+    '0%';
 
-  el.syncBtn.disabled = true;
-  el.trashBtn.disabled = true;
-  el.progressWrap.classList.remove('hidden');
-  el.progressFill.style.width = '0%';
-  el.progressText.textContent = `Moving 0 / ${items.length} to Trash`;
-  el.log.innerHTML = '';
+  el.progressText.textContent =
+    `Moving 0 / ${items.length} to Trash`;
+
+  el.log.innerHTML =
+    '';
 
   try {
-    const resp = await fetch('/drive/trash', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        items: items.map(({ id, name, isFolder }) => ({ id, name, isFolder })),
-      }),
-    });
+    const resp =
+      await fetch(
+        '/drive/trash',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type':
+              'application/json'
+          },
+          body: JSON.stringify({
+            items:
+              items.map(
+                ({
+                  id,
+                  name,
+                  isFolder
+                }) => ({
+                  id,
+                  name,
+                  isFolder
+                })
+              )
+          })
+        }
+      );
 
-    const data = await resp.json().catch(() => ({}));
+    const data =
+      await resp
+        .json()
+        .catch(
+          () => ({})
+        );
 
     if (!resp.ok) {
-      throw new Error(data.detail || data.error || `HTTP ${resp.status}`);
+      throw new Error(
+        data.detail ||
+        data.error ||
+        `HTTP ${resp.status}`
+      );
     }
 
-    for (const result of data.results || []) {
+    for (
+      const result of
+      data.results || []
+    ) {
       if (result.success) {
-        addLog(`✓ Moved to Trash: ${result.name}`, 'ok');
-        state.selected.delete(result.id);
+        addLog(
+          `✓ Moved to Trash: ${result.name}`,
+          'ok'
+        );
+
+        state.selected.delete(
+          result.id
+        );
       } else {
-        addLog(`Error: ${result.name} — ${result.error}`, 'err');
+        addLog(
+          `Error: ${result.name} — ${result.error}`,
+          'err'
+        );
       }
     }
 
-    const moved = Number(data.trashed) || 0;
-    const failed = Number(data.failed) || 0;
-    el.progressFill.style.width = items.length ? `${Math.round(((moved + failed) / items.length) * 100)}%` : '100%';
-    el.progressText.textContent = failed
-      ? `Done — ${moved} moved, ${failed} failed`
-      : `Done — ${moved} item${moved === 1 ? '' : 's'} moved to Trash`;
+    const moved =
+      Number(
+        data.trashed
+      ) || 0;
 
-    // Drive listings and selection sizes are now stale, so refresh them.
+    const failed =
+      Number(
+        data.failed
+      ) || 0;
+
+    el.progressFill.style.width =
+      items.length
+        ? `${Math.round(
+            ((moved + failed) /
+              items.length) *
+              100
+          )}%`
+        : '100%';
+
+    el.progressText.textContent =
+      failed
+        ? `Done — ${moved} moved, ${failed} failed`
+        : `Done — ${moved} item${
+            moved === 1
+              ? ''
+              : 's'
+          } moved to Trash`;
+
     state.folderCache.clear();
-    state.selectionStats = null;
+    state.selectionStats =
+      null;
+
     renderSelectedList();
-    await loadFolder(folderIdForCurrentPath(), { force: true });
+
+    await loadFolder(
+      folderIdForCurrentPath(),
+      { force: true }
+    );
+
     updateSelectionSize();
+
   } catch (err) {
-    console.error('Drive trash error:', err);
-    addLog(`Error: ${err.message}`, 'err');
-    el.progressText.textContent = 'Delete failed — see log';
+    console.error(
+      'Drive trash error:',
+      err
+    );
+
+    addLog(
+      `Error: ${err.message}`,
+      'err'
+    );
+
+    el.progressText.textContent =
+      'Delete failed — see log';
+
   } finally {
-    el.syncBtn.disabled = state.selected.size === 0;
-    el.trashBtn.disabled = state.selected.size === 0;
+    el.syncBtn.disabled =
+      state.selected.size === 0;
+
+    el.trashBtn.disabled =
+      state.selected.size === 0;
+
     setSyncButtonText();
   }
 }
 
-async function startSync() {
-  const items = Array.from(state.selected.values());
-  if (items.length === 0 || state.syncActive) return;
 
-  state.syncActive = true;
-  state.syncController = new AbortController();
-  el.syncBtn.disabled = true;
-  el.trashBtn.disabled = true;
-  el.selectAllBtn && (el.selectAllBtn.disabled = true);
-  el.progressWrap.classList.remove('hidden');
-  el.progressFill.style.width = '0%';
-  el.progressText.textContent = 'Starting…';
-  el.log.innerHTML = '';
-  if (el.cancelSyncBtn) {
-    el.cancelSyncBtn.classList.remove('hidden');
-    el.cancelSyncBtn.disabled = false;
-    el.cancelSyncBtn.textContent = 'Cancel sync';
+/* =========================================================
+   SYNC
+   ========================================================= */
+
+async function startSync() {
+  const items =
+    Array.from(
+      state.selected.values()
+    );
+
+  if (
+    items.length === 0 ||
+    state.syncActive
+  ) {
+    return;
   }
 
-  const destFolder = el.destFolder.value.trim() || 'DriveSync';
+  state.syncActive =
+    true;
+
+  state.syncController =
+    new AbortController();
+
+  el.syncBtn.disabled =
+    true;
+
+  el.trashBtn.disabled =
+    true;
+
+  if (el.selectAllBtn) {
+    el.selectAllBtn.disabled =
+      true;
+  }
+
+  el.progressWrap.classList.remove(
+    'hidden'
+  );
+
+  el.progressFill.style.width =
+    '0%';
+
+  el.progressText.textContent =
+    'Starting…';
+
+  el.log.innerHTML =
+    '';
+
+  /* FIX: reliably show the cancel button */
+  showCancelButton();
+
+  const destFolder =
+    el.destFolder.value.trim() ||
+    'DriveSync';
 
   try {
-    const resp = await fetch('/upload/sync', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ items, destFolder }),
-      signal: state.syncController.signal,
-    });
+    const resp =
+      await fetch(
+        '/upload/sync',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type':
+              'application/json'
+          },
+          body: JSON.stringify({
+            items,
+            destFolder
+          }),
+          signal:
+            state.syncController
+              .signal
+        }
+      );
 
-    if (!resp.ok || !resp.body) {
-      const data = await resp.json().catch(() => ({}));
-      throw new Error(data.detail || data.error || `HTTP ${resp.status}`);
+    if (
+      !resp.ok ||
+      !resp.body
+    ) {
+      const data =
+        await resp
+          .json()
+          .catch(
+            () => ({})
+          );
+
+      throw new Error(
+        data.detail ||
+        data.error ||
+        `HTTP ${resp.status}`
+      );
     }
 
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
+    const reader =
+      resp.body.getReader();
+
+    const decoder =
+      new TextDecoder();
+
     let buffer = '';
 
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      const {
+        done,
+        value
+      } =
+        await reader.read();
 
-      buffer += decoder.decode(value, { stream: true });
-      const events = buffer.split('\n\n');
-      buffer = events.pop();
+      if (done) {
+        break;
+      }
 
-      for (const evt of events) {
-        const lines = evt.split('\n');
-        const eventType = lines[0]?.replace('event: ', '');
-        const dataLine = lines[1]?.replace('data: ', '');
-        if (!dataLine) continue;
-
-        const data = JSON.parse(dataLine);
-
-        if (eventType === 'start') {
-          el.progressText.textContent = `0 / ${data.total}`;
-        } else if (eventType === 'progress') {
-          const pct = data.total
-            ? Math.round((data.done / data.total) * 100)
-            : 100;
-          el.progressFill.style.width = `${pct}%`;
-          el.progressText.textContent = `${data.done} / ${data.total}`;
-          if (data.existing) {
-            addLog(`↻ ${data.current} — already exists in OneDrive, skipped`, 'info');
-          } else if (data.skipped) {
-            addLog(`⚠ Skipped: ${data.current} — ${data.reason || 'unsupported'}`, 'err');
-          } else {
-            addLog(`✓ ${data.current}`, 'ok');
+      buffer +=
+        decoder.decode(
+          value,
+          {
+            stream: true
           }
-        } else if (eventType === 'complete') {
-          el.progressFill.style.width = '100%';
-          const skipped = Number(data.skipped) || 0;
-          const existing = Number(data.existing) || 0;
-          const uploaded = Math.max(0, Number(data.done) - skipped);
-          const nonExistingSkipped = Math.max(0, skipped - existing);
-          el.progressText.textContent = existing
-            ? `Done — ${uploaded} synced, ${existing} already existed${nonExistingSkipped ? `, ${nonExistingSkipped} skipped` : ''}`
-            : skipped
-              ? `Done — ${uploaded} synced, ${skipped} skipped`
-              : `Done — ${data.done} files synced`;
+        );
+
+      const events =
+        buffer.split(
+          '\n\n'
+        );
+
+      buffer =
+        events.pop();
+
+      for (
+        const evt of
+        events
+      ) {
+        const lines =
+          evt.split('\n');
+
+        const eventType =
+          lines[0]?.replace(
+            'event: ',
+            ''
+          );
+
+        const dataLine =
+          lines[1]?.replace(
+            'data: ',
+            ''
+          );
+
+        if (!dataLine) {
+          continue;
+        }
+
+        const data =
+          JSON.parse(
+            dataLine
+          );
+
+        if (
+          eventType === 'start'
+        ) {
+          el.progressText.textContent =
+            `0 / ${data.total}`;
+
+        } else if (
+          eventType === 'progress'
+        ) {
+          const pct =
+            data.total
+              ? Math.round(
+                  (data.done /
+                    data.total) *
+                    100
+                )
+              : 100;
+
+          el.progressFill.style.width =
+            `${pct}%`;
+
+          el.progressText.textContent =
+            `${data.done} / ${data.total}`;
+
+          if (data.existing) {
+            addLog(
+              `↻ ${data.current} — already exists in OneDrive, skipped`,
+              'info'
+            );
+
+          } else if (
+            data.skipped
+          ) {
+            addLog(
+              `⚠ Skipped: ${data.current} — ${data.reason || 'unsupported'}`,
+              'err'
+            );
+
+          } else {
+            addLog(
+              `✓ ${data.current}`,
+              'ok'
+            );
+          }
+
+        } else if (
+          eventType === 'complete'
+        ) {
+          el.progressFill.style.width =
+            '100%';
+
+          const skipped =
+            Number(
+              data.skipped
+            ) || 0;
+
+          const existing =
+            Number(
+              data.existing
+            ) || 0;
+
+          const uploaded =
+            Math.max(
+              0,
+              Number(
+                data.done
+              ) - skipped
+            );
+
+          const nonExistingSkipped =
+            Math.max(
+              0,
+              skipped -
+                existing
+            );
+
+          el.progressText.textContent =
+            existing
+              ? `Done — ${uploaded} synced, ${existing} already existed${
+                  nonExistingSkipped
+                    ? `, ${nonExistingSkipped} skipped`
+                    : ''
+                }`
+              : skipped
+                ? `Done — ${uploaded} synced, ${skipped} skipped`
+                : `Done — ${data.done} files synced`;
+
           addLog(
             existing || skipped
-              ? `Sync complete — ${uploaded} synced, ${existing} already existed${nonExistingSkipped ? `, ${nonExistingSkipped} skipped` : ''}.`
+              ? `Sync complete — ${uploaded} synced, ${existing} already existed${
+                  nonExistingSkipped
+                    ? `, ${nonExistingSkipped} skipped`
+                    : ''
+                }.`
               : 'Sync complete.',
-            skipped ? 'info' : 'ok'
+            skipped
+              ? 'info'
+              : 'ok'
           );
+
           showToast(
             existing
               ? `Sync completed — ${uploaded} uploaded, ${existing} already existed and were skipped.`
               : skipped
-                ? `Sync completed with ${skipped} skipped item${skipped === 1 ? '' : 's'}.`
+                ? `Sync completed with ${skipped} skipped item${
+                    skipped === 1
+                      ? ''
+                      : 's'
+                  }.`
                 : 'Sync completed successfully.',
-            skipped ? 'info' : 'success'
+            skipped
+              ? 'info'
+              : 'success'
           );
-        } else if (eventType === 'cancelled') {
-          el.progressText.textContent = 'Sync cancelled';
-          addLog('Sync cancelled by user.', 'err');
-          if (el.cancelSyncBtn) el.cancelSyncBtn.classList.add('hidden');
-          showToast('Sync cancelled successfully', 'success');
-        } else if (eventType === 'error') {
-          addLog(`Error: ${data.message}`, 'err');
-          el.progressText.textContent = 'Sync failed — see log';
-          if (el.cancelSyncBtn) {
-            el.cancelSyncBtn.classList.add('hidden');
-            el.cancelSyncBtn.disabled = false;
-            el.cancelSyncBtn.textContent = 'Cancel sync';
-          }
-          showToast('Sync failed — see log', 'error');
+
+          /* FIX: completion always removes the cancel button */
+          hideCancelButton();
+
+        } else if (
+          eventType === 'cancelled'
+        ) {
+          el.progressText.textContent =
+            'Sync cancelled';
+
+          addLog(
+            'Sync cancelled by user.',
+            'err'
+          );
+
+          /* FIX: immediately hide + disable */
+          hideCancelButton();
+
+          showToast(
+            'Sync cancelled successfully',
+            'success'
+          );
+
+        } else if (
+          eventType === 'error'
+        ) {
+          addLog(
+            `Error: ${data.message}`,
+            'err'
+          );
+
+          el.progressText.textContent =
+            'Sync failed — see log';
+
+          /* FIX: failed sync must also hide it */
+          hideCancelButton();
+
+          showToast(
+            'Sync failed — see log',
+            'error'
+          );
         }
       }
     }
+
   } catch (err) {
-    if (err.name === 'AbortError') {
-      el.progressText.textContent = 'Sync cancelled';
-      addLog('Sync cancelled by user.', 'err');
-      showToast('Sync cancelled successfully', 'success');
+    if (
+      err.name ===
+      'AbortError'
+    ) {
+      el.progressText.textContent =
+        'Sync cancelled';
+
+      addLog(
+        'Sync cancelled by user.',
+        'err'
+      );
+
+      /* FIX: browser abort also hides button */
+      hideCancelButton();
+
+      showToast(
+        'Sync cancelled successfully',
+        'success'
+      );
+
     } else {
-      console.error('Sync error:', err);
-      addLog(`Error: ${err.message}`, 'err');
-      el.progressText.textContent = 'Sync failed — see log';
-      showToast('Sync failed — see log', 'error');
+      console.error(
+        'Sync error:',
+        err
+      );
+
+      addLog(
+        `Error: ${err.message}`,
+        'err'
+      );
+
+      el.progressText.textContent =
+        'Sync failed — see log';
+
+      hideCancelButton();
+
+      showToast(
+        'Sync failed — see log',
+        'error'
+      );
     }
+
   } finally {
-    state.syncActive = false;
-    state.syncController = null;
-    if (el.cancelSyncBtn) {
-      el.cancelSyncBtn.classList.add('hidden');
-      el.cancelSyncBtn.disabled = false;
-      el.cancelSyncBtn.textContent = 'Cancel sync';
-    }
-    el.syncBtn.disabled = state.selected.size === 0;
-    el.trashBtn.disabled = state.selected.size === 0;
+    state.syncActive =
+      false;
+
+    state.syncController =
+      null;
+
+    /* FIX: guaranteed terminal cleanup */
+    hideCancelButton();
+
+    el.syncBtn.disabled =
+      state.selected.size ===
+      0;
+
+    el.trashBtn.disabled =
+      state.selected.size ===
+      0;
+
     updateSelectAllButton();
     setSyncButtonText();
   }
 }
 
+
+/* =========================================================
+   CANCEL SYNC
+   ========================================================= */
+
 function cancelSync() {
-  if (!state.syncActive || !state.syncController) return;
-  if (el.cancelSyncBtn) {
-    el.cancelSyncBtn.disabled = true;
-    el.cancelSyncBtn.textContent = 'Cancelling…';
-  }
-  el.progressText.textContent = 'Cancelling…';
-  state.syncController.abort();
-  // Do not leave the button stuck in Cancelling… while the fetch unwinds.
-  window.setTimeout(() => {
-    if (!state.syncActive) return;
-    if (el.cancelSyncBtn) {
-      el.cancelSyncBtn.classList.add('hidden');
-      el.cancelSyncBtn.disabled = false;
-      el.cancelSyncBtn.textContent = 'Cancel sync';
-    }
-  }, 150);
-}
-
-el.refreshBtn.onclick = () => {
-  state.folderCache.delete(folderIdForCurrentPath());
-  loadFolder(folderIdForCurrentPath(), { force: true });
-};
-
-el.syncBtn.onclick = startSync;
-el.cancelSyncBtn?.addEventListener('click', cancelSync);
-el.trashBtn.onclick = moveSelectedToTrash;
-el.selectAllBtn?.addEventListener('click', selectAllCurrentView);
-
-let searchTimer = null;
-el.driveSearch?.addEventListener('input', () => {
-  const term = el.driveSearch.value.trim();
-  if (el.clearSearchBtn) el.clearSearchBtn.classList.toggle('hidden', term.length === 0);
-  clearTimeout(searchTimer);
-
-  if (term.length === 0) {
-    clearDriveSearch(true);
+  if (
+    !state.syncActive ||
+    !state.syncController
+  ) {
     return;
   }
 
-  if (term.length < 2) return;
-  searchTimer = setTimeout(() => searchDrive(term), 300);
-});
+  /* Immediately show cancellation state */
+  el.progressText.textContent =
+    'Cancelling…';
 
-el.driveSearch?.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter') {
-    event.preventDefault();
-    clearTimeout(searchTimer);
-    searchDrive(el.driveSearch.value);
+  /*
+    IMPORTANT:
+    Hide the button immediately rather than
+    waiting for the SSE connection/server
+    to unwind.
+  */
+  hideCancelButton();
+
+  /*
+    Abort the browser request.
+    The server also detects the closed
+    connection and aborts its controller.
+  */
+  state.syncController.abort();
+}
+
+
+el.refreshBtn.onclick = () => {
+  state.folderCache.delete(
+    folderIdForCurrentPath()
+  );
+
+  loadFolder(
+    folderIdForCurrentPath(),
+    {
+      force: true
+    }
+  );
+};
+
+
+el.syncBtn.onclick =
+  startSync;
+
+
+el.cancelSyncBtn?.addEventListener(
+  'click',
+  cancelSync
+);
+
+
+el.trashBtn.onclick =
+  moveSelectedToTrash;
+
+
+el.selectAllBtn?.addEventListener(
+  'click',
+  selectAllCurrentView
+);
+
+
+let searchTimer = null;
+
+
+el.driveSearch?.addEventListener(
+  'input',
+  () => {
+    const term =
+      el.driveSearch.value.trim();
+
+    if (el.clearSearchBtn) {
+      el.clearSearchBtn.classList.toggle(
+        'hidden',
+        term.length === 0
+      );
+    }
+
+    clearTimeout(
+      searchTimer
+    );
+
+    if (term.length === 0) {
+      clearDriveSearch(true);
+      return;
+    }
+
+    if (term.length < 2) {
+      return;
+    }
+
+    searchTimer =
+      setTimeout(
+        () =>
+          searchDrive(term),
+        300
+      );
   }
-});
+);
 
-el.clearSearchBtn?.addEventListener('click', () => clearDriveSearch(true));
+
+el.driveSearch?.addEventListener(
+  'keydown',
+  (event) => {
+    if (
+      event.key === 'Enter'
+    ) {
+      event.preventDefault();
+
+      clearTimeout(
+        searchTimer
+      );
+
+      searchDrive(
+        el.driveSearch.value
+      );
+    }
+  }
+);
+
+
+el.clearSearchBtn?.addEventListener(
+  'click',
+  () =>
+    clearDriveSearch(true)
+);
+
+
+/* =========================================================
+   CURSOR GLOW
+   ========================================================= */
 
 let glowFrame = 0;
 let glowX = 0;
 let glowY = 0;
 
-document.addEventListener('mousemove', (event) => {
-  if (!el.glow) return;
-  glowX = event.clientX;
-  glowY = event.clientY;
-  if (glowFrame) return;
-  glowFrame = requestAnimationFrame(() => {
-    el.glow.style.left = '0';
-    el.glow.style.top = '0';
-    el.glow.style.transform = `translate3d(${glowX}px, ${glowY}px, 0) translate(-50%, -50%)`;
-    glowFrame = 0;
-  });
-});
+
+document.addEventListener(
+  'mousemove',
+  (event) => {
+    if (!el.glow) {
+      return;
+    }
+
+    glowX =
+      event.clientX;
+
+    glowY =
+      event.clientY;
+
+    if (glowFrame) {
+      return;
+    }
+
+    glowFrame =
+      requestAnimationFrame(
+        () => {
+          el.glow.style.left =
+            '0';
+
+          el.glow.style.top =
+            '0';
+
+          el.glow.style.transform =
+            `translate3d(${glowX}px, ${glowY}px, 0) translate(-50%, -50%)`;
+
+          glowFrame = 0;
+        }
+      );
+  }
+);
+
 
 function escapeHtml(value) {
-  const div = document.createElement('div');
-  div.textContent = String(value);
+  const div =
+    document.createElement(
+      'div'
+    );
+
+  div.textContent =
+    String(value);
+
   return div.innerHTML;
 }
 
-/* NoteVault-style title animation: slide the first line, then type the second. */
-const titleText = 'Without the mess.';
+
+/* =========================================================
+   NOTEVAULT TITLE ANIMATION
+   ========================================================= */
+
+const titleText =
+  'Without the mess.';
+
 let titleIndex = 0;
+
+
 function typeMainTitle() {
-  if (!el.titleType) return;
-  if (titleIndex < titleText.length) {
-    el.titleType.textContent += titleText[titleIndex];
+  if (!el.titleType) {
+    return;
+  }
+
+  if (
+    titleIndex <
+    titleText.length
+  ) {
+    el.titleType.textContent +=
+      titleText[titleIndex];
+
     titleIndex += 1;
-    setTimeout(typeMainTitle, 45);
+
+    setTimeout(
+      typeMainTitle,
+      45
+    );
+
   } else {
-    el.titleType.classList.add('typed');
+    el.titleType.classList.add(
+      'typed'
+    );
   }
 }
-setTimeout(typeMainTitle, 1200);
+
+
+setTimeout(
+  typeMainTitle,
+  1200
+);
+
+
+/* =========================================================
+   INITIALIZE
+   ========================================================= */
+
+/*
+  Important:
+  Explicitly hide the cancel button on initial page load
+  using the native hidden property so CSS cannot override it.
+*/
+hideCancelButton();
 
 checkStatus();
+
 renderSelectedList();
