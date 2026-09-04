@@ -3,6 +3,7 @@ const axios = require('axios');
 const { getDriveClient } = require('../auth/google');
 const { refreshTokens } = require('../auth/microsoft');
 const { Readable } = require('stream');
+const { createLimiter } = require('../utils/limiter');
 
 const router = express.Router();
 
@@ -40,26 +41,6 @@ function isAbortLike(err) {
 
 const STALL_TIMEOUT_MS = 45_000; // no bytes moved for 45s = treat the transfer as dead
 const AXIOS_TIMEOUT_MS = 60_000;
-
-async function mapWithConcurrency(items, concurrency, fn) {
-  const results = new Array(items.length);
-  let nextIndex = 0;
-
-  async function worker() {
-    while (true) {
-      const index = nextIndex++;
-      if (index >= items.length) return;
-      results[index] = await fn(items[index], index);
-    }
-  }
-
-  const workerCount = Math.min(concurrency, items.length);
-  await Promise.all(
-    Array.from({ length: workerCount }, () => worker())
-  );
-
-  return results;
-}
 
 // Wraps a readable stream so it self-destructs if no 'data' event arrives
 // within STALL_TIMEOUT_MS. Without this, a network hiccup mid-download or
@@ -134,157 +115,149 @@ async function ensureMsToken(req) {
   return fresh.access_token;
 }
 
-async function walkDrive(
-  drive,
-  fileId,
-  isFolder,
-  relPath,
-  out,
-  visitedFolders = new Set(),
-  signal = null,
-  onScan = null
-) {
-  if (signal?.aborted) throw new Error('Sync cancelled');
+async function collectDriveItems(drive, items, signal, send = null) {
+  const out = [];
+  const seenFolders = new Set();
+  const limiter = createLimiter(WALK_CONCURRENCY);
+  let current = (items || []).map((item) => ({
+    id: item.id,
+    isFolder: Boolean(item.isFolder),
+    relPath: item.name || item.id,
+  }));
+  let scanned = 0;
 
-  if (!isFolder) {
-    const meta = await getResolvedFileMeta(drive, fileId, signal);
-    if (!meta) return;
-
-    if (meta.mimeType === FOLDER_MIME) {
-      return walkDrive(
-        drive,
-        meta.id,
-        true,
-        relPath,
-        out,
-        visitedFolders,
-        signal,
-        onScan
-      );
-    }
-
-    out.push({
-      id: meta.id,
-      relPath,
-      mimeType: meta.mimeType,
-      name: relPath.split('/').pop(),
-      size: meta.size == null ? null : Number(meta.size),
-      fileExtension: meta.fileExtension || '',
-      shortcutDetails: null,
-    });
-
-    if (onScan) onScan(relPath);
-    return;
-  }
-
-  if (visitedFolders.has(fileId)) return;
-  visitedFolders.add(fileId);
-
-  let pageToken;
-
-  do {
+  while (current.length > 0) {
     if (signal?.aborted) throw new Error('Sync cancelled');
 
-    const res = await withBackoff(() => drive.files.list({
-      q: `'${fileId}' in parents and trashed = false`,
-      spaces: 'drive',
-      corpora: 'user',
-      includeItemsFromAllDrives: true,
-      supportsAllDrives: true,
-      fields: 'nextPageToken, files(id,name,mimeType,size,fileExtension,shortcutDetails(targetId,targetMimeType),capabilities(canDownload))',
-      pageSize: 1000,
-      pageToken,
-      orderBy: 'folder,name',
-      timeout: AXIOS_TIMEOUT_MS,
-    }), 5, 500, signal);
+    const next = [];
 
-    const children = res.data.files || [];
+    // IMPORTANT: process one queue level at a time. A worker never holds a
+    // limiter slot while recursively waiting for another limiter slot. This
+    // avoids the deadlock that caused large selections to sit at "Starting…".
+    await Promise.all(current.map((task) => limiter(async () => {
+      if (signal?.aborted) throw new Error('Sync cancelled');
 
-    // IMPORTANT: do not reuse one semaphore for the parent walk and its
-    // recursive child walks. That pattern can deadlock when all semaphore
-    // slots are occupied by parent tasks waiting for child slots. Each page
-    // now has its own bounded worker pool, while recursion itself is direct.
-    await mapWithConcurrency(
-      children,
-      WALK_CONCURRENCY,
-      async (child) => {
-        if (signal?.aborted) throw new Error('Sync cancelled');
+      if (task.isFolder) {
+        if (seenFolders.has(task.id)) return;
+        seenFolders.add(task.id);
 
-        const isShortcut = child.mimeType === SHORTCUT_MIME;
-        const targetMimeType = child.shortcutDetails?.targetMimeType || '';
-        const shortcutTargetId = child.shortcutDetails?.targetId || '';
+        let pageToken;
+        do {
+          if (signal?.aborted) throw new Error('Sync cancelled');
 
-        if (isShortcut && shortcutTargetId) {
-          const targetMeta = await getResolvedFileMeta(
-            drive,
-            shortcutTargetId,
-            signal
-          );
+          const res = await withBackoff(() => drive.files.list({
+            q: `'${task.id}' in parents and trashed = false`,
+            spaces: 'drive',
+            corpora: 'user',
+            includeItemsFromAllDrives: true,
+            supportsAllDrives: true,
+            fields: 'nextPageToken, files(id,name,mimeType,size,fileExtension,shortcutDetails(targetId,targetMimeType),capabilities(canDownload))',
+            pageSize: 1000,
+            pageToken,
+            orderBy: 'folder,name',
+          }), 5, 500, signal);
 
-          if (!targetMeta) return;
+          for (const child of res.data.files || []) {
+            if (signal?.aborted) throw new Error('Sync cancelled');
 
-          if (
-            targetMeta.mimeType === FOLDER_MIME ||
-            targetMimeType === FOLDER_MIME
-          ) {
-            await walkDrive(
-              drive,
-              targetMeta.id,
-              true,
-              `${relPath}/${child.name}`,
-              out,
-              visitedFolders,
-              signal,
-              onScan
-            );
-            return;
+            const childPath = `${task.relPath}/${child.name}`;
+            const isShortcut = child.mimeType === SHORTCUT_MIME;
+            const targetId = child.shortcutDetails?.targetId || '';
+            const targetMimeType = child.shortcutDetails?.targetMimeType || '';
+
+            if (isShortcut && targetId) {
+              const targetMeta = await getResolvedFileMeta(drive, targetId, signal);
+              if (!targetMeta) {
+                scanned += 1;
+                continue;
+              }
+
+              if (targetMeta.mimeType === FOLDER_MIME || targetMimeType === FOLDER_MIME) {
+                next.push({
+                  id: targetMeta.id,
+                  isFolder: true,
+                  relPath: childPath,
+                });
+              } else {
+                out.push({
+                  id: targetMeta.id,
+                  relPath: childPath,
+                  mimeType: targetMeta.mimeType,
+                  name: child.name,
+                  size: targetMeta.size == null ? null : Number(targetMeta.size),
+                  fileExtension: targetMeta.fileExtension || '',
+                  shortcutDetails: child.shortcutDetails,
+                });
+              }
+              scanned += 1;
+              continue;
+            }
+
+            if (child.mimeType === FOLDER_MIME) {
+              next.push({
+                id: child.id,
+                isFolder: true,
+                relPath: childPath,
+              });
+            } else {
+              out.push({
+                id: child.id,
+                relPath: childPath,
+                mimeType: child.mimeType,
+                name: child.name,
+                size: child.size == null ? null : Number(child.size),
+                fileExtension: child.fileExtension || '',
+                shortcutDetails: child.shortcutDetails || null,
+              });
+            }
+
+            scanned += 1;
           }
 
-          out.push({
-            id: targetMeta.id,
-            relPath: `${relPath}/${child.name}`,
-            mimeType: targetMeta.mimeType,
-            name: child.name,
-            size: targetMeta.size == null ? null : Number(targetMeta.size),
-            fileExtension: targetMeta.fileExtension || '',
-            shortcutDetails: child.shortcutDetails,
-          });
-
-          if (onScan) onScan(`${relPath}/${child.name}`);
+          pageToken = res.data.nextPageToken;
+        } while (pageToken);
+      } else {
+        const meta = await getResolvedFileMeta(drive, task.id, signal);
+        if (!meta) {
+          scanned += 1;
           return;
         }
 
-        const childIsFolder = child.mimeType === FOLDER_MIME;
-
-        if (childIsFolder) {
-          await walkDrive(
-            drive,
-            child.id,
-            true,
-            `${relPath}/${child.name}`,
-            out,
-            visitedFolders,
-            signal,
-            onScan
-          );
+        if (meta.mimeType === FOLDER_MIME) {
+          next.push({
+            id: meta.id,
+            isFolder: true,
+            relPath: task.relPath,
+          });
         } else {
           out.push({
-            id: child.id,
-            relPath: `${relPath}/${child.name}`,
-            mimeType: child.mimeType,
-            name: child.name,
-            size: child.size == null ? null : Number(child.size),
-            fileExtension: child.fileExtension || '',
-            shortcutDetails: child.shortcutDetails || null,
+            id: meta.id,
+            relPath: task.relPath,
+            mimeType: meta.mimeType,
+            name: task.relPath.split('/').pop(),
+            size: meta.size == null ? null : Number(meta.size),
+            fileExtension: meta.fileExtension || '',
+            shortcutDetails: null,
           });
-
-          if (onScan) onScan(`${relPath}/${child.name}`);
         }
+        scanned += 1;
       }
-    );
 
-    pageToken = res.data.nextPageToken;
-  } while (pageToken);
+      if (send) {
+        send('status', {
+          phase: 'scanning',
+          done: scanned,
+          total: null,
+          current: task.relPath,
+          filesFound: out.length,
+        });
+      }
+    })));
+
+    current = next;
+  }
+
+  return out;
 }
 
 const GOOGLE_EXPORTS = {
@@ -347,7 +320,6 @@ async function getResolvedFileMeta(drive, fileId, signal, seen = new Set()) {
       fileId,
       fields: FILE_META_FIELDS,
       supportsAllDrives: true,
-      timeout: AXIOS_TIMEOUT_MS,
     }), 5, 500, signal);
   } catch (err) {
     if (isFileNotFoundError(err)) return null;
@@ -376,7 +348,7 @@ async function getDriveFileStream(drive, file, signal) {
   if (exportInfo) {
     const response = await withBackoff(() => drive.files.export(
       { fileId: file.id, mimeType: exportInfo.mimeType },
-      { responseType: 'stream', signal, timeout: AXIOS_TIMEOUT_MS }
+      { responseType: 'stream', signal }
     ), 5, 500, signal);
 
     return {
@@ -414,7 +386,7 @@ async function getDriveFileStream(drive, file, signal) {
   try {
     const response = await withBackoff(() => drive.files.get(
       { fileId: file.id, alt: 'media', acknowledgeAbuse: true },
-      { responseType: 'stream', signal, timeout: AXIOS_TIMEOUT_MS }
+      { responseType: 'stream', signal }
     ), 5, 500, signal);
 
     return {
@@ -577,11 +549,6 @@ router.post('/sync', requireAuth, async (req, res) => {
     }
   });
 
-  // Keep the SSE connection visibly alive during phases (like the initial
-  // folder walk) that can otherwise go a long time without sending an
-  // actual event. Without this, a slow walk on a big selection can look
-  // to the browser/proxy like a dead connection and get closed — which
-  // then surfaces to the user as a false "Sync cancelled".
   const heartbeat = setInterval(() => {
     if (!res.writableEnded && !res.destroyed) {
       res.write(': heartbeat\n\n');
@@ -593,71 +560,29 @@ router.post('/sync', requireAuth, async (req, res) => {
   const dest = destFolder || 'DriveSync';
 
   try {
-    const flatFiles = [];
-    const seenFiles = new Set();
-    const selectedItems = items || [];
-    let scannedItems = 0;
-    let scannedFiles = 0;
-
-    // Tell the browser immediately that the server is alive and is scanning.
-    // Previously the first SSE event was sent only after the entire recursive
-    // Drive walk finished, making the UI sit on "Starting…" for minutes.
     send('status', {
-      done: 0,
-      total: selectedItems.length,
-      current: 'Scanning selected Google Drive folders…',
       phase: 'scanning',
+      done: 0,
+      total: null,
+      current: 'Scanning selected Google Drive folders…',
+      filesFound: 0,
     });
 
-    const collectedPerItem = await mapWithConcurrency(
-      selectedItems,
-      Math.min(WALK_CONCURRENCY, 4),
-      async (item) => {
-        if (syncController.signal.aborted) {
-          throw new Error('Sync cancelled');
-        }
-
-        const collected = [];
-        await walkDrive(
-          drive,
-          item.id,
-          item.isFolder,
-          item.name,
-          collected,
-          new Set(),
-          syncController.signal,
-          () => {
-            scannedFiles += 1;
-            // Periodically report scanning progress without flooding SSE.
-            if (scannedFiles % 10 === 0) {
-              send('status', {
-                done: scannedFiles,
-                total: selectedItems.length,
-                current: `Scanning… ${scannedFiles} files found`,
-                phase: 'scanning',
-              });
-            }
-          }
-        );
-
-        scannedItems += 1;
-        send('status', {
-          done: scannedItems,
-          total: selectedItems.length,
-          current: `Scanned ${item.name}`,
-          phase: 'scanning',
-        });
-
-        return collected;
-      }
+    const flatFilesRaw = await collectDriveItems(
+      drive,
+      items || [],
+      syncController.signal,
+      send
     );
 
-    for (const collected of collectedPerItem) {
-      for (const file of collected) {
-        if (seenFiles.has(file.id)) continue;
-        seenFiles.add(file.id);
-        flatFiles.push(file);
-      }
+    // Deduplicate by Drive file ID while preserving distinct relative paths
+    // for genuinely different files.
+    const seenFiles = new Set();
+    const flatFiles = [];
+    for (const file of flatFilesRaw) {
+      if (seenFiles.has(file.id)) continue;
+      seenFiles.add(file.id);
+      flatFiles.push(file);
     }
 
     send('start', { total: flatFiles.length });
@@ -666,123 +591,205 @@ router.post('/sync', requireAuth, async (req, res) => {
     let skipped = 0;
     let existing = 0;
 
-    const CONCURRENCY = 5; // a few files in flight at once; high enough to hide
-                            // per-request latency, low enough not to trip Graph/Drive rate limits
+    const CONCURRENCY = 5;
     let nextIndex = 0;
 
     async function worker() {
       while (true) {
         if (syncController.signal.aborted) throw new Error('Sync cancelled');
+
         const myIndex = nextIndex;
         if (myIndex >= flatFiles.length) return;
         nextIndex += 1;
+
         const file = flatFiles[myIndex];
 
-      try {
-        send('status', { done, total: flatFiles.length, current: file.relPath, phase: 'checking' });
-        const originalMeta = await getResolvedFileMeta(drive, file.id, syncController.signal);
-        if (!originalMeta) {
-          done += 1;
-          skipped += 1;
-          send('progress', {
+        try {
+          send('status', {
             done,
             total: flatFiles.length,
             current: file.relPath,
-            skipped: true,
-            reason: 'File no longer exists in Google Drive — skipped and continuing',
+            phase: 'checking',
           });
-          continue;
-        }
-        const displayName = file.name || originalMeta.name;
-        const oneDrivePathBase = `${dest}/${file.relPath}`;
 
-        send('status', { done, total: flatFiles.length, current: file.relPath, phase: 'downloading' });
-        const transfer = await getDriveFileStream(drive, {
-          ...originalMeta,
-          id: originalMeta.id,
-          name: displayName,
-        }, syncController.signal);
+          const originalMeta = await getResolvedFileMeta(
+            drive,
+            file.id,
+            syncController.signal
+          );
 
-        if (transfer.unsupported) {
-          done += 1;
-          skipped += 1;
-          send('progress', {
-            done,
-            total: flatFiles.length,
-            current: file.relPath,
-            skipped: true,
-            reason: transfer.unsupportedReason,
-          });
-          continue;
-        }
-
-        const accessToken = await ensureMsToken(req);
-        let oneDrivePath = oneDrivePathBase;
-        let stream = transfer.stream;
-        let size = transfer.size;
-
-        if (transfer.exportExtension) {
-          if (!oneDrivePath.toLowerCase().endsWith(transfer.exportExtension)) {
-            oneDrivePath += transfer.exportExtension;
+          if (!originalMeta) {
+            done += 1;
+            skipped += 1;
+            send('progress', {
+              done,
+              total: flatFiles.length,
+              current: file.relPath,
+              skipped: true,
+              reason: 'File no longer exists in Google Drive — skipped and continuing',
+            });
+            continue;
           }
-        }
 
-        // Resume-safe behavior: never upload the same destination path twice.
-        // This makes a cancelled sync safe to run again.
-        if (await oneDriveItemExists(accessToken, oneDrivePath, syncController.signal)) {
+          const displayName = file.name || originalMeta.name;
+          const oneDrivePathBase = `${dest}/${file.relPath}`;
+
+          send('status', {
+            done,
+            total: flatFiles.length,
+            current: file.relPath,
+            phase: 'downloading',
+          });
+
+          const transfer = await getDriveFileStream(
+            drive,
+            {
+              ...originalMeta,
+              id: originalMeta.id,
+              name: displayName,
+            },
+            syncController.signal
+          );
+
+          if (transfer.unsupported) {
+            done += 1;
+            skipped += 1;
+            send('progress', {
+              done,
+              total: flatFiles.length,
+              current: file.relPath,
+              skipped: true,
+              reason: transfer.unsupportedReason,
+            });
+            continue;
+          }
+
+          const accessToken = await ensureMsToken(req);
+          let oneDrivePath = oneDrivePathBase;
+          let stream = transfer.stream;
+          let size = transfer.size;
+
+          if (transfer.exportExtension) {
+            if (!oneDrivePath.toLowerCase().endsWith(transfer.exportExtension)) {
+              oneDrivePath += transfer.exportExtension;
+            }
+          }
+
+          if (await oneDriveItemExists(accessToken, oneDrivePath, syncController.signal)) {
+            done += 1;
+            existing += 1;
+            send('progress', {
+              done,
+              total: flatFiles.length,
+              current: file.relPath,
+              skipped: true,
+              existing: true,
+              reason: 'Already exists in OneDrive — skipped',
+            });
+            continue;
+          }
+
+          if (transfer.exportExtension) {
+            const buffered = await bufferStream(
+              stream,
+              syncController.signal
+            );
+            stream = Readable.from(buffered.buffer);
+            size = buffered.size;
+          }
+
+          send('status', {
+            done,
+            total: flatFiles.length,
+            current: file.relPath,
+            phase: 'uploading',
+          });
+
+          await uploadToOneDrive(
+            accessToken,
+            oneDrivePath,
+            stream,
+            size,
+            syncController.signal
+          );
+
           done += 1;
-          existing += 1;
+
+          send('progress', {
+            done,
+            total: flatFiles.length,
+            current: file.relPath,
+            skipped: false,
+          });
+
+        } catch (fileErr) {
+          if (
+            syncController.signal.aborted ||
+            isAbortLike(fileErr)
+          ) {
+            throw new Error('Sync cancelled');
+          }
+
+          done += 1;
+          skipped += 1;
+
+          console.warn(
+            `Skipping ${file.relPath}:`,
+            fileErr.message
+          );
+
           send('progress', {
             done,
             total: flatFiles.length,
             current: file.relPath,
             skipped: true,
-            existing: true,
-            reason: 'Already exists in OneDrive — skipped',
+            reason: fileErr.message,
           });
-          continue;
         }
-
-        // Only export/buffer after confirming the destination is missing.
-        if (transfer.exportExtension) {
-          const buffered = await bufferStream(stream, syncController.signal);
-          stream = Readable.from(buffered.buffer);
-          size = buffered.size;
-        }
-
-        send('status', { done, total: flatFiles.length, current: file.relPath, phase: 'uploading' });
-        await uploadToOneDrive(accessToken, oneDrivePath, stream, size, syncController.signal);
-        done += 1;
-        send('progress', { done, total: flatFiles.length, current: file.relPath, skipped: false });
-      } catch (fileErr) {
-        if (syncController.signal.aborted || isAbortLike(fileErr)) throw new Error('Sync cancelled');
-
-        done += 1;
-        skipped += 1;
-        console.warn(`Skipping ${file.relPath}:`, fileErr.message);
-        send('progress', {
-          done,
-          total: flatFiles.length,
-          current: file.relPath,
-          skipped: true,
-          reason: fileErr.message,
-        });
-      }
       }
     }
 
     await Promise.all(
-      Array.from({ length: Math.min(CONCURRENCY, flatFiles.length) }, () => worker())
+      Array.from(
+        {
+          length: Math.min(
+            CONCURRENCY,
+            flatFiles.length
+          ),
+        },
+        () => worker()
+      )
     );
 
-    send('complete', { done, total: flatFiles.length, skipped, existing });
+    send('complete', {
+      done,
+      total: flatFiles.length,
+      skipped,
+      existing,
+    });
+
   } catch (err) {
-    if (syncController.signal.aborted || clientDisconnected || isAbortLike(err)) {
-      if (!clientDisconnected) send('cancelled', { message: 'Sync cancelled' });
+    if (
+      syncController.signal.aborted ||
+      clientDisconnected ||
+      isAbortLike(err)
+    ) {
+      if (!clientDisconnected) {
+        send('cancelled', {
+          message: 'Sync cancelled',
+        });
+      }
+
       console.log('Sync cancelled by client.');
     } else {
-      console.error('Sync error:', err.message);
-      send('error', { message: err.message });
+      console.error(
+        'Sync error:',
+        err.message
+      );
+
+      send('error', {
+        message: err.message,
+      });
     }
   } finally {
     clearInterval(heartbeat);
