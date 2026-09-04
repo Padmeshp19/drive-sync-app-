@@ -14,6 +14,8 @@ const state = {
   selectAllController: null,
   syncController: null,
   syncActive: false,
+  syncId: null,
+  cancelRequested: false,
 };
 
 
@@ -1595,6 +1597,9 @@ async function startSync() {
   state.syncActive =
     true;
 
+  state.cancelRequested = false;
+  state.syncId = null;
+
   state.syncController =
     new AbortController();
 
@@ -1733,6 +1738,7 @@ async function startSync() {
         if (
           eventType === 'start'
         ) {
+          state.syncId = data.syncId || null;
           el.progressText.textContent =
             `0 / ${data.total}`;
 
@@ -1758,6 +1764,12 @@ async function startSync() {
             addLog(
               `↻ ${data.current} — already exists in OneDrive, skipped`,
               'info'
+            );
+
+          } else if (data.linked) {
+            addLog(
+              `✓ ${data.current} — saved as a Google Drive link`,
+              'ok'
             );
 
           } else if (
@@ -1789,6 +1801,11 @@ async function startSync() {
           const existing =
             Number(
               data.existing
+            ) || 0;
+
+          const linked =
+            Number(
+              data.linked
             ) || 0;
 
           const uploaded =
@@ -1832,14 +1849,12 @@ async function startSync() {
 
           showToast(
             existing
-              ? `Sync completed — ${uploaded} uploaded, ${existing} already existed and were skipped.`
+              ? `Sync completed — ${uploaded} uploaded, ${existing} already existed${linked ? `, ${linked} Drive links preserved` : ''}.`
               : skipped
-                ? `Sync completed with ${skipped} skipped item${
-                    skipped === 1
-                      ? ''
-                      : 's'
-                  }.`
-                : 'Sync completed successfully.',
+                ? `Sync completed with ${skipped} skipped item${skipped === 1 ? '' : 's'}${linked ? ` and ${linked} Drive links preserved` : ''}.`
+                : linked
+                  ? `Sync completed — ${linked} Drive links preserved.`
+                  : 'Sync completed successfully.',
             skipped
               ? 'info'
               : 'success'
@@ -1851,6 +1866,9 @@ async function startSync() {
         } else if (
           eventType === 'cancelled'
         ) {
+          state.cancelRequested = true;
+          state.syncId = null;
+
           el.progressText.textContent =
             'Sync cancelled';
 
@@ -1895,19 +1913,28 @@ async function startSync() {
       'AbortError'
     ) {
       el.progressText.textContent =
-        'Sync cancelled';
+        state.cancelRequested
+          ? 'Sync cancelled'
+          : 'Sync connection lost';
 
       addLog(
-        'Sync cancelled by user.',
-        'err'
+        state.cancelRequested
+          ? 'Sync cancelled by user.'
+          : 'Sync connection closed unexpectedly. The server may still be processing the sync.',
+        state.cancelRequested
+          ? 'err'
+          : 'info'
       );
 
-      /* FIX: browser abort also hides button */
       hideCancelButton();
 
       showToast(
-        'Sync cancelled successfully',
-        'success'
+        state.cancelRequested
+          ? 'Sync cancelled successfully'
+          : 'Sync connection lost — sync may continue on the server',
+        state.cancelRequested
+          ? 'success'
+          : 'info'
       );
 
     } else {
@@ -1938,6 +1965,7 @@ async function startSync() {
 
     state.syncController =
       null;
+    state.syncId = null;
 
     /* FIX: guaranteed terminal cleanup */
     hideCancelButton();
@@ -1963,29 +1991,29 @@ async function startSync() {
 function cancelSync() {
   if (
     !state.syncActive ||
-    !state.syncController
+    !state.syncId ||
+    state.cancelRequested
   ) {
     return;
   }
 
-  /* Immediately show cancellation state */
-  el.progressText.textContent =
-    'Cancelling…';
-
-  /*
-    IMPORTANT:
-    Hide the button immediately rather than
-    waiting for the SSE connection/server
-    to unwind.
-  */
+  state.cancelRequested = true;
+  el.progressText.textContent = 'Cancelling…';
   hideCancelButton();
 
-  /*
-    Abort the browser request.
-    The server also detects the closed
-    connection and aborts its controller.
-  */
-  state.syncController.abort();
+  // Explicit cancellation is a separate request. We deliberately do NOT
+  // abort the SSE fetch here; the server will emit a final `cancelled` event
+  // through the stream after it stops the active workers. This also prevents
+  // accidental browser/proxy connection drops from being interpreted as a
+  // user cancellation.
+  fetch('/upload/sync/cancel', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ syncId: state.syncId }),
+    keepalive: true,
+  }).catch((err) => {
+    console.error('Cancel request failed:', err);
+  });
 }
 
 

@@ -3,6 +3,7 @@ const axios = require('axios');
 const { getDriveClient } = require('../auth/google');
 const { refreshTokens } = require('../auth/microsoft');
 const { Readable } = require('stream');
+const { randomUUID } = require('crypto');
 const { createLimiter } = require('../utils/limiter');
 
 const router = express.Router();
@@ -23,6 +24,8 @@ const WALK_CONCURRENCY = 8;
 // SSE comment line keeps bytes flowing without meaning anything to the
 // client's event parser.
 const HEARTBEAT_INTERVAL_MS = 15_000;
+
+const activeSyncs = new Map();
 
 function requireAuth(req, res, next) {
   if (!req.session.googleTokens) return res.status(401).json({ error: 'Not authenticated with Google' });
@@ -261,7 +264,7 @@ const GOOGLE_EXPORTS = {
 
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
 const SHORTCUT_MIME = 'application/vnd.google-apps.shortcut';
-const FILE_META_FIELDS = 'id,name,mimeType,size,fileExtension,capabilities(canDownload),shortcutDetails(targetId,targetMimeType)';
+const FILE_META_FIELDS = 'id,name,mimeType,size,fileExtension,webViewLink,capabilities(canDownload),shortcutDetails(targetId,targetMimeType)';
 
 function getExportInfo(mimeType) {
   return GOOGLE_EXPORTS[mimeType] || null;
@@ -341,6 +344,8 @@ async function getDriveFileStream(drive, file, signal) {
 
   // Google Workspace files without a supported export format cannot be sent
   // through alt=media. Skip them cleanly instead of failing the whole sync.
+  const fallbackLink = file.webViewLink || `https://drive.google.com/open?id=${encodeURIComponent(file.id)}`;
+
   if (isGoogleWorkspaceFile(file.mimeType)) {
     return {
       stream: null,
@@ -348,6 +353,8 @@ async function getDriveFileStream(drive, file, signal) {
       exportExtension: '',
       exported: false,
       unsupported: true,
+      linkOnly: true,
+      linkUrl: fallbackLink,
       unsupportedReason: `Google Workspace file type ${file.mimeType} has no supported Drive export format`,
     };
   }
@@ -359,6 +366,8 @@ async function getDriveFileStream(drive, file, signal) {
       exportExtension: '',
       exported: false,
       unsupported: true,
+      linkOnly: true,
+      linkUrl: fallbackLink,
       unsupportedReason: 'Google Drive does not allow this file to be downloaded',
     };
   }
@@ -407,7 +416,7 @@ async function bufferStream(stream, signal = null) {
   return { buffer: Buffer.concat(chunks, size), size };
 }
 
-async function oneDriveItemExists(accessToken, oneDrivePath, signal) {
+async function getOneDriveItem(accessToken, oneDrivePath, signal) {
   const encodedPath = oneDrivePath.split('/').map(encodeURIComponent).join('/');
   try {
     const response = await withBackoff(() => axios.get(
@@ -419,11 +428,38 @@ async function oneDriveItemExists(accessToken, oneDrivePath, signal) {
         timeout: 20000,
       }
     ), 3, 400, signal);
-    return response.status === 200 && Boolean(response.data?.id);
+    return response.data?.id ? response.data : null;
   } catch (err) {
-    if (err.response?.status === 404) return false;
+    if (err.response?.status === 404) return null;
     throw err;
   }
+}
+
+async function oneDriveItemExists(accessToken, oneDrivePath, signal) {
+  return Boolean(await getOneDriveItem(accessToken, oneDrivePath, signal));
+}
+
+function addPathSuffix(filePath, n) {
+  const slash = filePath.lastIndexOf('/');
+  const dir = slash >= 0 ? filePath.slice(0, slash + 1) : '';
+  const name = slash >= 0 ? filePath.slice(slash + 1) : filePath;
+  const dot = name.lastIndexOf('.');
+  if (dot > 0) return `${dir}${name.slice(0, dot)} (${n})${name.slice(dot)}`;
+  return `${dir}${name} (${n})`;
+}
+
+function claimUniquePath(basePath, claimedPaths) {
+  let candidate = basePath;
+  let n = 2;
+  while (claimedPaths.has(candidate.toLowerCase())) {
+    candidate = addPathSuffix(basePath, n++);
+  }
+  claimedPaths.add(candidate.toLowerCase());
+  return candidate;
+}
+
+function makeDriveLinkContent(url) {
+  return `[InternetShortcut]\r\nURL=${url}\r\n`;
 }
 
 async function uploadToOneDrive(accessToken, oneDrivePath, stream, sizeBytes, signal) {
@@ -513,27 +549,18 @@ router.post('/sync', requireAuth, async (req, res) => {
     Connection: 'keep-alive',
   });
 
+  const syncId = randomUUID();
+  const syncController = new AbortController();
+  activeSyncs.set(syncId, { controller: syncController, createdAt: Date.now() });
+
   const send = (event, data) => {
     if (!res.writableEnded && !res.destroyed) {
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     }
   };
 
-  const syncController = new AbortController();
-  let clientDisconnected = false;
-
-  req.on('close', () => {
-    if (!res.writableEnded) {
-      clientDisconnected = true;
-      syncController.abort();
-    }
-  });
-
-  // Keep the SSE connection visibly alive during phases (like the initial
-  // folder walk) that can otherwise go a long time without sending an
-  // actual event. Without this, a slow walk on a big selection can look
-  // to the browser/proxy like a dead connection and get closed — which
-  // then surfaces to the user as a false "Sync cancelled".
+  // A dropped SSE/browser connection does NOT cancel the sync. Explicit
+  // cancellation is sent through /sync/cancel.
   const heartbeat = setInterval(() => {
     if (!res.writableEnded && !res.destroyed) {
       res.write(': heartbeat\n\n');
@@ -549,15 +576,21 @@ router.post('/sync', requireAuth, async (req, res) => {
     const seenFiles = new Set();
     const walkLimit = createLimiter(WALK_CONCURRENCY);
 
-    // Walk every top-level selected item concurrently (each keeps its own
-    // visited-folders set to avoid cross-item interference) instead of
-    // fully enumerating one item before starting the next.
     const collectedPerItem = await Promise.all(
       (items || []).map((item) =>
         walkLimit(async () => {
           if (syncController.signal.aborted) throw new Error('Sync cancelled');
           const collected = [];
-          await walkDrive(drive, item.id, item.isFolder, item.name, collected, new Set(), syncController.signal, walkLimit);
+          await walkDrive(
+            drive,
+            item.id,
+            item.isFolder,
+            item.name,
+            collected,
+            new Set(),
+            syncController.signal,
+            walkLimit
+          );
           return collected;
         })
       )
@@ -571,114 +604,238 @@ router.post('/sync', requireAuth, async (req, res) => {
       }
     }
 
-    send('start', { total: flatFiles.length });
+    send('start', { total: flatFiles.length, syncId });
 
     let done = 0;
     let skipped = 0;
     let existing = 0;
-
-    const CONCURRENCY = 5; // a few files in flight at once; high enough to hide
-                            // per-request latency, low enough not to trip Graph/Drive rate limits
+    let linked = 0;
     let nextIndex = 0;
+    const claimedPaths = new Set();
+    const CONCURRENCY = 5;
 
     async function worker() {
       while (true) {
         if (syncController.signal.aborted) throw new Error('Sync cancelled');
-        const myIndex = nextIndex;
-        if (myIndex >= flatFiles.length) return;
-        nextIndex += 1;
-        const file = flatFiles[myIndex];
+        const index = nextIndex++;
+        if (index >= flatFiles.length) return;
+        const file = flatFiles[index];
 
-      try {
-        send('status', { done, total: flatFiles.length, current: file.relPath, phase: 'checking' });
-        const originalMeta = await getResolvedFileMeta(drive, file.id, syncController.signal);
-        if (!originalMeta) {
-          done += 1;
-          skipped += 1;
-          send('progress', {
-            done,
-            total: flatFiles.length,
-            current: file.relPath,
-            skipped: true,
-            reason: 'File no longer exists in Google Drive — skipped and continuing',
-          });
-          continue;
-        }
-        const displayName = file.name || originalMeta.name;
-        const oneDrivePathBase = `${dest}/${file.relPath}`;
+        try {
+          send('status', { done, total: flatFiles.length, current: file.relPath, phase: 'checking' });
 
-        send('status', { done, total: flatFiles.length, current: file.relPath, phase: 'downloading' });
-        const transfer = await getDriveFileStream(drive, {
-          ...originalMeta,
-          id: originalMeta.id,
-          name: displayName,
-        }, syncController.signal);
+          const originalMeta = await getResolvedFileMeta(drive, file.id, syncController.signal);
+          if (!originalMeta) {
+            done += 1;
+            skipped += 1;
+            send('progress', {
+              done,
+              total: flatFiles.length,
+              current: file.relPath,
+              skipped: true,
+              reason: 'File no longer exists in Google Drive — skipped and continuing',
+            });
+            continue;
+          }
 
-        if (transfer.unsupported) {
-          done += 1;
-          skipped += 1;
-          send('progress', {
-            done,
-            total: flatFiles.length,
-            current: file.relPath,
-            skipped: true,
-            reason: transfer.unsupportedReason,
-          });
-          continue;
-        }
+          const displayName = file.name || originalMeta.name;
+          let oneDrivePath = claimUniquePath(`${dest}/${file.relPath}`, claimedPaths);
+          let accessToken = await ensureMsToken(req);
 
-        const accessToken = await ensureMsToken(req);
-        let oneDrivePath = oneDrivePathBase;
-        let stream = transfer.stream;
-        let size = transfer.size;
+          // If a destination folder already occupies the source file's path,
+          // preserve the file with a deterministic suffix instead of failing 409.
+          let existingItem = await getOneDriveItem(accessToken, oneDrivePath, syncController.signal);
+          if (existingItem?.folder) {
+            let n = 2;
+            let candidate = addPathSuffix(oneDrivePath, n);
+            while (await getOneDriveItem(accessToken, candidate, syncController.signal)) {
+              candidate = addPathSuffix(oneDrivePath, ++n);
+            }
+            claimedPaths.add(candidate.toLowerCase());
+            oneDrivePath = candidate;
+            existingItem = null;
+          }
 
-        if (transfer.exportExtension) {
-          if (!oneDrivePath.toLowerCase().endsWith(transfer.exportExtension)) {
+          if (existingItem?.file) {
+            done += 1;
+            existing += 1;
+            send('progress', {
+              done,
+              total: flatFiles.length,
+              current: file.relPath,
+              skipped: true,
+              existing: true,
+              reason: 'Already exists in OneDrive — skipped',
+            });
+            continue;
+          }
+
+          send('status', { done, total: flatFiles.length, current: file.relPath, phase: 'downloading' });
+
+          const transfer = await getDriveFileStream(
+            drive,
+            { ...originalMeta, id: originalMeta.id, name: displayName },
+            syncController.signal
+          );
+
+          // Google Workspace items without a transferable binary (e.g. Forms)
+          // are preserved as a Windows Internet Shortcut so nothing is lost.
+          if (transfer.linkOnly) {
+            let linkPath = oneDrivePath.toLowerCase().endsWith('.url')
+              ? oneDrivePath
+              : `${oneDrivePath}.url`;
+            if (claimedPaths.has(linkPath.toLowerCase())) {
+              linkPath = claimUniquePath(linkPath, claimedPaths);
+            } else {
+              claimedPaths.add(linkPath.toLowerCase());
+            }
+
+            accessToken = await ensureMsToken(req);
+            const linkExisting = await getOneDriveItem(accessToken, linkPath, syncController.signal);
+            if (linkExisting?.file) {
+              done += 1;
+              existing += 1;
+              send('progress', {
+                done,
+                total: flatFiles.length,
+                current: file.relPath,
+                skipped: true,
+                existing: true,
+                reason: 'Drive link already exists in OneDrive — skipped',
+              });
+              continue;
+            }
+
+            const body = Buffer.from(makeDriveLinkContent(transfer.linkUrl), 'utf8');
+            await uploadToOneDrive(
+              accessToken,
+              linkPath,
+              Readable.from(body),
+              body.length,
+              syncController.signal
+            );
+
+            done += 1;
+            linked += 1;
+            send('progress', {
+              done,
+              total: flatFiles.length,
+              current: file.relPath,
+              skipped: false,
+              linked: true,
+              destination: linkPath,
+            });
+            continue;
+          }
+
+          let stream = transfer.stream;
+          let size = transfer.size;
+
+          if (transfer.exportExtension && !oneDrivePath.toLowerCase().endsWith(transfer.exportExtension)) {
             oneDrivePath += transfer.exportExtension;
           }
-        }
 
-        // Resume-safe behavior: never upload the same destination path twice.
-        // This makes a cancelled sync safe to run again.
-        if (await oneDriveItemExists(accessToken, oneDrivePath, syncController.signal)) {
+          // Re-check after adding an export extension.
+          existingItem = await getOneDriveItem(accessToken, oneDrivePath, syncController.signal);
+          if (existingItem?.folder) {
+            let n = 2;
+            let candidate = addPathSuffix(oneDrivePath, n);
+            while (await getOneDriveItem(accessToken, candidate, syncController.signal)) {
+              candidate = addPathSuffix(oneDrivePath, ++n);
+            }
+            claimedPaths.add(candidate.toLowerCase());
+            oneDrivePath = candidate;
+            existingItem = null;
+          }
+
+          if (existingItem?.file) {
+            done += 1;
+            existing += 1;
+            send('progress', {
+              done,
+              total: flatFiles.length,
+              current: file.relPath,
+              skipped: true,
+              existing: true,
+              reason: 'Already exists in OneDrive — skipped',
+            });
+            continue;
+          }
+
+          if (transfer.exportExtension) {
+            const buffered = await bufferStream(stream, syncController.signal);
+            stream = Readable.from(buffered.buffer);
+            size = buffered.size;
+          }
+
+          send('status', { done, total: flatFiles.length, current: file.relPath, phase: 'uploading' });
+
+          try {
+            await uploadToOneDrive(accessToken, oneDrivePath, stream, size, syncController.signal);
+          } catch (uploadErr) {
+            if (uploadErr.response?.status !== 409) throw uploadErr;
+
+            // A 409 usually means a race or a destination collision. Re-fetch
+            // the source stream and retry once using a unique destination name.
+            let n = 2;
+            let retryPath = addPathSuffix(oneDrivePath, n);
+            while (await getOneDriveItem(accessToken, retryPath, syncController.signal)) {
+              retryPath = addPathSuffix(oneDrivePath, ++n);
+            }
+            claimedPaths.add(retryPath.toLowerCase());
+
+            const retryTransfer = await getDriveFileStream(
+              drive,
+              { ...originalMeta, id: originalMeta.id, name: displayName },
+              syncController.signal
+            );
+
+            if (retryTransfer.linkOnly) {
+              retryPath = retryPath.toLowerCase().endsWith('.url') ? retryPath : `${retryPath}.url`;
+              const body = Buffer.from(makeDriveLinkContent(retryTransfer.linkUrl), 'utf8');
+              await uploadToOneDrive(accessToken, retryPath, Readable.from(body), body.length, syncController.signal);
+              linked += 1;
+            } else {
+              let retryStream = retryTransfer.stream;
+              let retrySize = retryTransfer.size;
+              if (retryTransfer.exportExtension) {
+                if (!retryPath.toLowerCase().endsWith(retryTransfer.exportExtension)) {
+                  retryPath += retryTransfer.exportExtension;
+                }
+                const buffered = await bufferStream(retryStream, syncController.signal);
+                retryStream = Readable.from(buffered.buffer);
+                retrySize = buffered.size;
+              }
+              await uploadToOneDrive(accessToken, retryPath, retryStream, retrySize, syncController.signal);
+            }
+            oneDrivePath = retryPath;
+          }
+
           done += 1;
-          existing += 1;
+          send('progress', {
+            done,
+            total: flatFiles.length,
+            current: file.relPath,
+            skipped: false,
+            destination: oneDrivePath,
+          });
+
+        } catch (fileErr) {
+          if (syncController.signal.aborted || isAbortLike(fileErr)) {
+            throw new Error('Sync cancelled');
+          }
+
+          done += 1;
+          skipped += 1;
+          console.warn(`Skipping ${file.relPath}:`, fileErr.message);
           send('progress', {
             done,
             total: flatFiles.length,
             current: file.relPath,
             skipped: true,
-            existing: true,
-            reason: 'Already exists in OneDrive — skipped',
+            reason: fileErr.message,
           });
-          continue;
         }
-
-        // Only export/buffer after confirming the destination is missing.
-        if (transfer.exportExtension) {
-          const buffered = await bufferStream(stream, syncController.signal);
-          stream = Readable.from(buffered.buffer);
-          size = buffered.size;
-        }
-
-        send('status', { done, total: flatFiles.length, current: file.relPath, phase: 'uploading' });
-        await uploadToOneDrive(accessToken, oneDrivePath, stream, size, syncController.signal);
-        done += 1;
-        send('progress', { done, total: flatFiles.length, current: file.relPath, skipped: false });
-      } catch (fileErr) {
-        if (syncController.signal.aborted || isAbortLike(fileErr)) throw new Error('Sync cancelled');
-
-        done += 1;
-        skipped += 1;
-        console.warn(`Skipping ${file.relPath}:`, fileErr.message);
-        send('progress', {
-          done,
-          total: flatFiles.length,
-          current: file.relPath,
-          skipped: true,
-          reason: fileErr.message,
-        });
-      }
       }
     }
 
@@ -686,19 +843,40 @@ router.post('/sync', requireAuth, async (req, res) => {
       Array.from({ length: Math.min(CONCURRENCY, flatFiles.length) }, () => worker())
     );
 
-    send('complete', { done, total: flatFiles.length, skipped, existing });
+    send('complete', {
+      done,
+      total: flatFiles.length,
+      skipped,
+      existing,
+      linked,
+    });
   } catch (err) {
-    if (syncController.signal.aborted || clientDisconnected || isAbortLike(err)) {
-      if (!clientDisconnected) send('cancelled', { message: 'Sync cancelled' });
-      console.log('Sync cancelled by client.');
+    if (syncController.signal.aborted || isAbortLike(err)) {
+      if (!res.destroyed && !res.writableEnded) {
+        send('cancelled', { message: 'Sync cancelled' });
+      }
+      console.log('Sync cancelled by user.');
     } else {
       console.error('Sync error:', err.message);
-      send('error', { message: err.message });
+      if (!res.destroyed && !res.writableEnded) {
+        send('error', { message: err.message });
+      }
     }
   } finally {
     clearInterval(heartbeat);
+    activeSyncs.delete(syncId);
     res.end();
   }
+});
+
+router.post('/sync/cancel', requireAuth, (req, res) => {
+  const syncId = String(req.body?.syncId || '');
+  const job = activeSyncs.get(syncId);
+  if (!syncId || !job) {
+    return res.status(404).json({ error: 'Sync job not found' });
+  }
+  job.controller.abort();
+  return res.json({ ok: true, cancelled: true });
 });
 
 module.exports = router;
