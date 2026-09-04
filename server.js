@@ -66,8 +66,34 @@ app.use('/drive', driveRoutes);
 app.use('/upload', uploadRoutes);
 
 // --- Start server ---
-const PORT = process.env.PORT || 10000;
+const PORT = Number(process.env.PORT) || 10000;
+const HOST = '0.0.0.0';
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Drive → OneDrive sync app running on 0.0.0.0:${PORT}`);
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    port: PORT,
+    uptime: process.uptime(),
+  });
+});
+
+const server = app.listen(PORT, HOST, () => {
+  console.log(`Drive → OneDrive sync app running on ${HOST}:${PORT}`);
+  console.log(`Health check: http://${HOST}:${PORT}/health`);
+});
+
+server.on('error', (err) => {
+  console.error('Server listen error:', err);
+});
+
+server.on('listening', () => {
+  console.log('SERVER LISTENING:', server.address());
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('UNHANDLED REJECTION:', err);
 });
