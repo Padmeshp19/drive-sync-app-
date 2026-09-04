@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Drive → OneDrive Sync</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="stars stars-one"></div>
+  <div class="stars stars-two"></div>
+  <div class="stars stars-three"></div>
+  <div id="glow"></div>
+
+  <div class="app">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Drive to OneDrive">
+        <span class="brand-mark">D</span>
+        <span>Drive <b>→</b> OneDrive</span>
+      </a>
+
+      <div class="conn-status" id="connStatus">
+        <button class="pill" id="googlePill">Google: checking…</button>
+        <button class="pill" id="msPill">Microsoft: checking…</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <p class="eyebrow">CLOUD SYNC</p>
+        <h1>Move your files.<br /><span>Without the mess.</span></h1>
+        <p class="hero-copy">Select folders or files from Google Drive and send them straight to OneDrive.</p>
+      </section>
+
+      <section class="layout">
+        <section class="glass-panel drive-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">SOURCE</p>
+              <h2>Google Drive</h2>
+            </div>
+            <button id="refreshBtn" class="icon-btn" title="Refresh Drive" aria-label="Refresh Drive">↻</button>
+          </div>
+
+          <div class="drive-path">
+            <span class="path-dot"></span>
+            <div id="breadcrumb" class="breadcrumb"></div>
+          </div>
+
+          <div class="tree-wrap">
+            <ul id="tree" class="tree"></ul>
+          </div>
+        </section>
+
+        <section class="glass-panel sync-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">DESTINATION</p>
+              <h2>OneDrive</h2>
+            </div>
+            <span class="destination-badge">READY</span>
+          </div>
+
+          <label class="field">
+            <span>Destination folder</span>
+            <div class="input-wrap">
+              <span class="input-icon">↳</span>
+              <input id="destFolder" type="text" value="DriveSync" spellcheck="false" />
+            </div>
+          </label>
+
+          <div class="selection-card">
+            <div class="selection-top">
+              <div>
+                <p class="panel-kicker">SELECTED</p>
+                <div id="selectionSummary" class="selection-summary">Nothing selected</div>
+              </div>
+              <div id="selectionSize" class="selection-size">0 GB</div>
+            </div>
+
+            <div class="size-track">
+              <div id="sizeTrackFill" class="size-track-fill"></div>
+            </div>
+
+            <div id="selectedList" class="selected-list">
+              <div class="empty-selection">Choose something from Google Drive.</div>
+            </div>
+          </div>
+
+          <button id="syncBtn" class="btn-primary" disabled>
+            <span>Select items to sync</span>
+            <span class="btn-arrow">→</span>
+          </button>
+
+          <div id="progressWrap" class="progress-wrap hidden">
+            <div class="progress-heading">
+              <span>SYNC PROGRESS</span>
+              <span id="progressText">Starting…</span>
+            </div>
+            <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
+            <ul id="log" class="log"></ul>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>Google Drive</span>
+      <span class="footer-line"></span>
+      <span>OneDrive</span>
+      <span class="footer-muted">Secure OAuth connection</span>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

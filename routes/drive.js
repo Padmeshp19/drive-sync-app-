@@ -1,6 +1,7 @@
 const express = require('express');
 const { getDriveClient } = require('../auth/google');
 const { createLimiter } = require('../utils/limiter');
+const { isRetryableError } = require('../utils/retry');
 
 const router = express.Router();
 
@@ -29,7 +30,10 @@ async function withBackoff(fn, retries = 5, delay = 500) {
     const code = err.code || err.response?.status;
     const isRateLimited = code === 429 || code === 403;
 
-    if (isRateLimited && retries > 0) {
+    // Also retry transient network failures (ETIMEDOUT, ENETUNREACH, a
+    // dropped connection, etc.) — previously only 429/403 were retried, so
+    // a one-off network blip permanently failed the request.
+    if ((isRateLimited || isRetryableError(err)) && retries > 0) {
       await new Promise((resolve) => setTimeout(resolve, delay));
       return withBackoff(fn, retries - 1, delay * 2);
     }

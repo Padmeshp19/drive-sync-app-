@@ -13,6 +13,7 @@ const state = {
   selectAllBusy: false,
   selectAllController: null,
   syncController: null,
+  syncCancelledByUser: false,
   syncActive: false,
 };
 
@@ -1598,6 +1599,14 @@ async function startSync() {
   state.syncController =
     new AbortController();
 
+  /* FIX: only a real click on Cancel counts as "cancelled by user" —
+     mobile browsers (Safari/Chrome) silently abort long-running fetches
+     when the tab is backgrounded or the screen locks, and that also
+     surfaces as an AbortError. Without this flag those got mislabeled
+     as a user cancellation that never happened. */
+  state.syncCancelledByUser =
+    false;
+
   el.syncBtn.disabled =
     true;
 
@@ -1873,8 +1882,13 @@ async function startSync() {
           el.progressText.textContent =
             'Sync cancelled';
 
+          /* FIX: only say "by user" if the user actually clicked Cancel —
+             the server sends this same event when the connection simply
+             dropped (network blip, backgrounded tab, etc.). */
           addLog(
-            'Sync cancelled by user.',
+            state.syncCancelledByUser
+              ? 'Sync cancelled by user.'
+              : 'Sync stopped — connection to the server was lost.',
             'err'
           );
 
@@ -1882,8 +1896,12 @@ async function startSync() {
           hideCancelButton();
 
           showToast(
-            'Sync cancelled successfully',
-            'success'
+            state.syncCancelledByUser
+              ? 'Sync cancelled successfully'
+              : 'Sync stopped — connection was lost',
+            state.syncCancelledByUser
+              ? 'success'
+              : 'error'
           );
 
         } else if (
@@ -1916,8 +1934,14 @@ async function startSync() {
       el.progressText.textContent =
         'Sync cancelled';
 
+      /* FIX: an AbortError isn't necessarily a user click — mobile Safari
+         and Chrome kill in-flight fetches when the tab is backgrounded or
+         the phone locks, which throws this exact same error. Only claim
+         "by user" when cancelSync() actually set the flag. */
       addLog(
-        'Sync cancelled by user.',
+        state.syncCancelledByUser
+          ? 'Sync cancelled by user.'
+          : 'Sync interrupted — the browser stopped the request (e.g. tab backgrounded or phone locked).',
         'err'
       );
 
@@ -1925,8 +1949,12 @@ async function startSync() {
       hideCancelButton();
 
       showToast(
-        'Sync cancelled successfully',
-        'success'
+        state.syncCancelledByUser
+          ? 'Sync cancelled successfully'
+          : 'Sync interrupted — try again',
+        state.syncCancelledByUser
+          ? 'success'
+          : 'error'
       );
 
     } else {
@@ -1998,6 +2026,11 @@ function cancelSync() {
     to unwind.
   */
   hideCancelButton();
+
+  /* FIX: mark this as a genuine user-initiated cancel before aborting,
+     so the AbortError this produces downstream is reported correctly. */
+  state.syncCancelledByUser =
+    true;
 
   /*
     Abort the browser request.

@@ -4,6 +4,7 @@ const { getDriveClient } = require('../auth/google');
 const { refreshTokens } = require('../auth/microsoft');
 const { Readable } = require('stream');
 const { createLimiter } = require('../utils/limiter');
+const { isRetryableError } = require('../utils/retry');
 
 const router = express.Router();
 
@@ -81,8 +82,13 @@ async function withBackoff(fn, retries = 5, delay = 500, signal = null) {
   } catch (err) {
     if (isAbortLike(err)) throw new Error('Sync cancelled');
 
-    const status = err.response?.status || err.code;
-    if ((status === 429 || status === 503) && retries > 0) {
+    // Retry HTTP 429/503 *and* transient network failures (ETIMEDOUT,
+    // ENETUNREACH, ECONNRESET, DNS hiccups, ...). Previously only 429/503
+    // were retried here, so any connectivity blip to Google or Microsoft's
+    // servers failed the request on the first try with no retry at all —
+    // that's the "connect ETIMEDOUT ..." / "connect ENETUNREACH ..."
+    // entries that showed up as permanently skipped files.
+    if (isRetryableError(err) && retries > 0) {
       const retryAfter = err.response?.headers?.['retry-after'];
       const wait = retryAfter ? parseInt(retryAfter, 10) * 1000 : delay;
 
@@ -498,7 +504,15 @@ async function uploadToOneDrive(accessToken, oneDrivePath, stream, sizeBytes, si
     }
 
     if (offset !== sizeBytes) {
-      throw new Error(`Uploaded ${offset} bytes but expected ${sizeBytes}`);
+      // A short/empty transfer here (most often 0 bytes uploaded) means the
+      // Drive download stream ended early without ever raising a stream
+      // 'error' — some connection resets surface as a clean-looking 'end'
+      // instead of an error. Tag it so the per-file retry loop in the sync
+      // route treats it the same as a network error and re-downloads the
+      // file fresh, instead of permanently skipping it after one bad read.
+      const mismatchErr = new Error(`Uploaded ${offset} bytes but expected ${sizeBytes}`);
+      mismatchErr.code = 'EUPLOADMISMATCH';
+      throw mismatchErr;
     }
   } else {
     const buffered = [];
@@ -594,6 +608,91 @@ router.post('/sync', requireAuth, async (req, res) => {
     const CONCURRENCY = 5;
     let nextIndex = 0;
 
+    // Attempts one download+upload of a file and returns how it went,
+    // instead of deciding done/skipped/existing itself — that lets the
+    // caller retry the whole thing on a transient failure without
+    // duplicating the "already handled, move on" bookkeeping.
+    async function transferOneFile(file) {
+      const originalMeta = await getResolvedFileMeta(
+        drive,
+        file.id,
+        syncController.signal
+      );
+
+      if (!originalMeta) {
+        return {
+          outcome: 'skipped',
+          reason: 'File no longer exists in Google Drive — skipped and continuing',
+        };
+      }
+
+      const displayName = file.name || originalMeta.name;
+      const oneDrivePathBase = `${dest}/${file.relPath}`;
+
+      send('status', {
+        done,
+        total: flatFiles.length,
+        current: file.relPath,
+        phase: 'downloading',
+      });
+
+      const transfer = await getDriveFileStream(
+        drive,
+        {
+          ...originalMeta,
+          id: originalMeta.id,
+          name: displayName,
+        },
+        syncController.signal
+      );
+
+      if (transfer.unsupported) {
+        return { outcome: 'skipped', reason: transfer.unsupportedReason };
+      }
+
+      const accessToken = await ensureMsToken(req);
+      let oneDrivePath = oneDrivePathBase;
+      let stream = transfer.stream;
+      let size = transfer.size;
+
+      if (transfer.exportExtension) {
+        if (!oneDrivePath.toLowerCase().endsWith(transfer.exportExtension)) {
+          oneDrivePath += transfer.exportExtension;
+        }
+      }
+
+      if (await oneDriveItemExists(accessToken, oneDrivePath, syncController.signal)) {
+        return {
+          outcome: 'skipped',
+          existing: true,
+          reason: 'Already exists in OneDrive — skipped',
+        };
+      }
+
+      if (transfer.exportExtension) {
+        const buffered = await bufferStream(stream, syncController.signal);
+        stream = Readable.from(buffered.buffer);
+        size = buffered.size;
+      }
+
+      send('status', {
+        done,
+        total: flatFiles.length,
+        current: file.relPath,
+        phase: 'uploading',
+      });
+
+      await uploadToOneDrive(
+        accessToken,
+        oneDrivePath,
+        stream,
+        size,
+        syncController.signal
+      );
+
+      return { outcome: 'uploaded' };
+    }
+
     async function worker() {
       while (true) {
         if (syncController.signal.aborted) throw new Error('Sync cancelled');
@@ -604,148 +703,90 @@ router.post('/sync', requireAuth, async (req, res) => {
 
         const file = flatFiles[myIndex];
 
-        try {
-          send('status', {
-            done,
-            total: flatFiles.length,
-            current: file.relPath,
-            phase: 'checking',
-          });
+        send('status', {
+          done,
+          total: flatFiles.length,
+          current: file.relPath,
+          phase: 'checking',
+        });
 
-          const originalMeta = await getResolvedFileMeta(
-            drive,
-            file.id,
-            syncController.signal
-          );
+        // A file gets a few full attempts (fresh download + fresh upload
+        // each time) before it's marked skipped. Without this, one
+        // transient hiccup — a dropped connection mid-download, a
+        // byte-count mismatch from a truncated stream — permanently failed
+        // the file on the very first try, which is why "Uploaded 0 bytes
+        // but expected ..." and "connect ETIMEDOUT ..." showed up as
+        // outright skips instead of being retried like a rate-limit is.
+        const MAX_FILE_ATTEMPTS = 3;
+        let result = null;
+        let lastErr = null;
 
-          if (!originalMeta) {
-            done += 1;
-            skipped += 1;
-            send('progress', {
-              done,
-              total: flatFiles.length,
-              current: file.relPath,
-              skipped: true,
-              reason: 'File no longer exists in Google Drive — skipped and continuing',
-            });
-            continue;
-          }
-
-          const displayName = file.name || originalMeta.name;
-          const oneDrivePathBase = `${dest}/${file.relPath}`;
-
-          send('status', {
-            done,
-            total: flatFiles.length,
-            current: file.relPath,
-            phase: 'downloading',
-          });
-
-          const transfer = await getDriveFileStream(
-            drive,
-            {
-              ...originalMeta,
-              id: originalMeta.id,
-              name: displayName,
-            },
-            syncController.signal
-          );
-
-          if (transfer.unsupported) {
-            done += 1;
-            skipped += 1;
-            send('progress', {
-              done,
-              total: flatFiles.length,
-              current: file.relPath,
-              skipped: true,
-              reason: transfer.unsupportedReason,
-            });
-            continue;
-          }
-
-          const accessToken = await ensureMsToken(req);
-          let oneDrivePath = oneDrivePathBase;
-          let stream = transfer.stream;
-          let size = transfer.size;
-
-          if (transfer.exportExtension) {
-            if (!oneDrivePath.toLowerCase().endsWith(transfer.exportExtension)) {
-              oneDrivePath += transfer.exportExtension;
+        for (let attempt = 1; attempt <= MAX_FILE_ATTEMPTS; attempt += 1) {
+          try {
+            result = await transferOneFile(file);
+            lastErr = null;
+            break;
+          } catch (attemptErr) {
+            if (syncController.signal.aborted || isAbortLike(attemptErr)) {
+              throw new Error('Sync cancelled');
             }
+
+            lastErr = attemptErr;
+
+            const transient =
+              isRetryableError(attemptErr) ||
+              attemptErr.code === 'ESTALLED' ||
+              attemptErr.code === 'EUPLOADMISMATCH';
+
+            if (transient && attempt < MAX_FILE_ATTEMPTS) {
+              console.warn(
+                `Retrying ${file.relPath} (attempt ${attempt} failed):`,
+                attemptErr.message
+              );
+              send('status', {
+                done,
+                total: flatFiles.length,
+                current: file.relPath,
+                phase: 'retrying',
+              });
+              await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+              continue;
+            }
+
+            break;
           }
+        }
 
-          if (await oneDriveItemExists(accessToken, oneDrivePath, syncController.signal)) {
-            done += 1;
-            existing += 1;
-            send('progress', {
-              done,
-              total: flatFiles.length,
-              current: file.relPath,
-              skipped: true,
-              existing: true,
-              reason: 'Already exists in OneDrive — skipped',
-            });
-            continue;
-          }
-
-          if (transfer.exportExtension) {
-            const buffered = await bufferStream(
-              stream,
-              syncController.signal
-            );
-            stream = Readable.from(buffered.buffer);
-            size = buffered.size;
-          }
-
-          send('status', {
-            done,
-            total: flatFiles.length,
-            current: file.relPath,
-            phase: 'uploading',
-          });
-
-          await uploadToOneDrive(
-            accessToken,
-            oneDrivePath,
-            stream,
-            size,
-            syncController.signal
-          );
-
-          done += 1;
-
-          send('progress', {
-            done,
-            total: flatFiles.length,
-            current: file.relPath,
-            skipped: false,
-          });
-
-        } catch (fileErr) {
-          if (
-            syncController.signal.aborted ||
-            isAbortLike(fileErr)
-          ) {
-            throw new Error('Sync cancelled');
-          }
-
+        if (lastErr) {
           done += 1;
           skipped += 1;
 
-          console.warn(
-            `Skipping ${file.relPath}:`,
-            fileErr.message
-          );
+          console.warn(`Skipping ${file.relPath}:`, lastErr.message);
 
           send('progress', {
             done,
             total: flatFiles.length,
             current: file.relPath,
             skipped: true,
-            reason: fileErr.message,
+            reason: lastErr.message,
           });
+          continue;
         }
+
+        done += 1;
+        if (result.outcome === 'skipped') {
+          skipped += 1;
+          if (result.existing) existing += 1;
+        }
+
+        send('progress', {
+          done,
+          total: flatFiles.length,
+          current: file.relPath,
+          skipped: result.outcome === 'skipped',
+          existing: Boolean(result.existing),
+          reason: result.reason,
+        });
       }
     }
 
