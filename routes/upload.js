@@ -118,13 +118,19 @@ async function withBackoff(fn, retries = 5, delay = 500, signal = null) {
   }
 }
 
-async function ensureMsToken(req) {
+async function ensureMsToken(req, signal = null) {
   const tokens = req.session.msTokens;
   if (Date.now() < (tokens.obtainedAt + tokens.expires_in * 1000) - 60000) {
     return tokens.access_token;
   }
 
-  const fresh = await refreshTokens(tokens.refresh_token);
+  // Wrapped in the same withBackoff used for every other network call, so a
+  // transient failure (including the now-bounded 20s timeout added in
+  // auth/microsoft.js) gets retried with backoff instead of immediately
+  // failing the file — a token refresh failing here used to fall straight
+  // through to the per-file retry, which redownloads the whole file just to
+  // try the same un-retried token call again.
+  const fresh = await withBackoff(() => refreshTokens(tokens.refresh_token, signal), 5, 500, signal);
   req.session.msTokens = { ...fresh, obtainedAt: Date.now() };
   return fresh.access_token;
 }
@@ -169,7 +175,7 @@ async function collectDriveItems(drive, items, signal, send = null) {
             pageSize: 1000,
             pageToken,
             orderBy: 'folder,name',
-          }), 5, 500, signal);
+          }, { timeout: 20000, signal }), 5, 500, signal);
 
           for (const child of res.data.files || []) {
             if (signal?.aborted) throw new Error('Sync cancelled');
@@ -334,7 +340,7 @@ async function getResolvedFileMeta(drive, fileId, signal, seen = new Set()) {
       fileId,
       fields: FILE_META_FIELDS,
       supportsAllDrives: true,
-    }), 5, 500, signal);
+    }, { timeout: 20000, signal }), 5, 500, signal);
   } catch (err) {
     if (isFileNotFoundError(err)) return null;
     throw err;
@@ -362,7 +368,7 @@ async function getDriveFileStream(drive, file, signal) {
   if (exportInfo) {
     const response = await withBackoff(() => drive.files.export(
       { fileId: file.id, mimeType: exportInfo.mimeType },
-      { responseType: 'stream', signal }
+      { responseType: 'stream', signal, timeout: 30000 }
     ), 5, 500, signal);
 
     return {
@@ -400,7 +406,7 @@ async function getDriveFileStream(drive, file, signal) {
   try {
     const response = await withBackoff(() => drive.files.get(
       { fileId: file.id, alt: 'media', acknowledgeAbuse: true },
-      { responseType: 'stream', signal }
+      { responseType: 'stream', signal, timeout: 30000 }
     ), 5, 500, signal);
 
     return {
@@ -658,7 +664,7 @@ router.post('/sync', requireAuth, async (req, res) => {
         return { outcome: 'skipped', reason: transfer.unsupportedReason };
       }
 
-      const accessToken = await ensureMsToken(req);
+      const accessToken = await ensureMsToken(req, syncController.signal);
       let oneDrivePath = oneDrivePathBase;
       let stream = transfer.stream;
       let size = transfer.size;

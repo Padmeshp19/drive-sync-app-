@@ -54,7 +54,7 @@ async function listChildren(drive, parentId, fields, pageToken = undefined) {
       pageSize: 200,
       pageToken,
       orderBy: 'folder,name',
-    })
+    }, { timeout: 20000 })
   );
 
   return {
@@ -168,7 +168,7 @@ router.post('/trash', requireGoogleAuth, async (req, res) => {
           requestBody: { trashed: true },
           supportsAllDrives: true,
           fields: 'id, name, trashed',
-        })
+        }, { timeout: 20000 })
       );
 
       results.push({
@@ -232,7 +232,7 @@ router.get('/search', requireGoogleAuth, async (req, res) => {
         pageSize: 100,
         pageToken,
         orderBy: 'folder,name',
-      })
+      }, { timeout: 20000 })
     );
 
     const files = (result.data.files || []).map((file) => ({
@@ -290,7 +290,7 @@ router.post('/selection-size', requireGoogleAuth, async (req, res) => {
                 fileId: item.id,
                 fields: 'id, name, mimeType, size',
                 supportsAllDrives: true,
-              })
+              }, { timeout: 20000 })
             );
 
             if (result.data.mimeType === FOLDER_MIME) {

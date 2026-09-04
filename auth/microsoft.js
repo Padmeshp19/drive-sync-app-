@@ -25,12 +25,12 @@ async function getTokensFromCode(code) {
   const { data } = await axios.post(
     `https://login.microsoftonline.com/${TENANT}/oauth2/v2.0/token`,
     params.toString(),
-    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 20000 }
   );
   return data; // { access_token, refresh_token, expires_in, ... }
 }
 
-async function refreshTokens(refreshToken) {
+async function refreshTokens(refreshToken, signal = null) {
   const params = new URLSearchParams({
     client_id: process.env.MS_CLIENT_ID,
     client_secret: process.env.MS_CLIENT_SECRET,
@@ -38,10 +38,16 @@ async function refreshTokens(refreshToken) {
     refresh_token: refreshToken,
     scope: SCOPES.join(' '),
   });
+  // Previously had no timeout at all, so if this host's route to
+  // login.microsoftonline.com was blackholed (same connectivity class as
+  // the ETIMEDOUT/ENETUNREACH errors seen elsewhere against Graph), the
+  // call would hang for minutes on the OS's own TCP timeout with nothing
+  // surfaced to the sync — which is exactly what "stuck with no error"
+  // looks like, since every file needing a fresh token blocks on it.
   const { data } = await axios.post(
     `https://login.microsoftonline.com/${TENANT}/oauth2/v2.0/token`,
     params.toString(),
-    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 20000, signal }
   );
   return data;
 }
